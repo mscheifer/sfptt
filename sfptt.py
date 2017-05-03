@@ -57,222 +57,225 @@ np.set_printoptions(threshold=np.nan,
 # break our principle of the result of a tree not changing at each new timestep
 # allowing up to save it into a constant.
 
+asserts = False
+
+def with_assert(op_factory, assert_factory):
+    if asserts:
+        with tf.control_dependencies(assert_factory()):
+            return op_factory()
+    return op_factory()
+
 def extract_singleton(op):
-    fst_dim = tf.shape(op)[0]
-    with tf.control_dependencies([tf.Assert(tf.equal(fst_dim, 1), [fst_dim])]):
-        return op[0]
+    def assert_one_element():
+        fst_dim = tf.shape(op)[0]
+        return [tf.Assert(tf.equal(fst_dim, 1), [fst_dim])]
+    return with_assert(lambda: op[0], assert_one_element)
 
-class Layer:
-    # gate idea is inspired by wavenet. They say it helps with vanishing
-    # gradients similar to LSTM gates and highway networks. I don't fully
-    # understand why yet. I actually removed the gate idea because I don't yet
-    # know how to integrate it with layer normalization but we'll figure it out
+def is_odd(op):
+    return tf.equal(op % 2, 1)
 
-    def make_conv_op(self, input):
-        # Need to add a fake batch dimension because all the conv functions
-        # assume you are using batches. Likewise we need to extract our "batch"
-        filt = extract_singleton(tf.nn.conv1d(tf.expand_dims(input, 0),
-             self.filter_weights, 2, 'SAME'))
-
-        return tf.tanh(tf.add(filt, self.filt_bias))
-
+def make_layer(lower_layer, num_output_channels):
     def make_weights(name, shape):
         init = tf.contrib.layers.xavier_initializer(dtype=tf.float32)
         return tf.Variable(init(shape), name=name + "_weights")
 
-    def __init__(self, lower_layer, num_output_channels):
-        self.num_output_channels = num_output_channels #TODO: delete
+    # First dimension is what we conv over, 2nd is number of channels
+    # Btw, .value fixes a really stupid bug with xavier_init because it
+    # doesn't auto convert the dimension to an integer
+    num_input_channels = lower_layer.result_op.get_shape()[1].value
 
-        self.push_f = lower_layer.push_input
-        
-        # First dimension is what we conv over, 2nd is number of channels
-        # Btw, .value fixes a really stupid bug with xavier_init because it
-        # doesn't auto convert the dimension to an integer
-        num_input_channels = lower_layer.result_op.get_shape()[1].value
+    filter_weights = make_weights("filter",
+        [2, num_input_channels, num_output_channels])
+    filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
+        dtype=tf.float32), name="filter_baises")
 
-        self.filter_weights = Layer.make_weights("filter",
-            [2, num_input_channels, num_output_channels])
-        self.filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
-            dtype=tf.float32), name="filter_baises")
+    def make_conv_op(input):
+        # Need to add a fake batch dimension because all the conv functions
+        # assume you are using batches. Likewise we need to extract our "batch"
+        filt = extract_singleton(tf.nn.conv1d(tf.expand_dims(input, 0),
+             filter_weights, 2, 'SAME'))
 
-        conv = self.make_conv_op(lower_layer.result_op)
+        return tf.tanh(tf.add(filt, filt_bias))
 
-        self.lower_layer_res = lower_layer.result_op # TODO delete
+    conv = make_conv_op(lower_layer.result_op)
 
-        self.conv = conv # TODO delete
+    assert lower_layer.max_layer_size % 2 == 0
+    max_conv_values = lower_layer.max_layer_size // 2
 
-        assert lower_layer.max_layer_size % 2 == 0
-        max_conv_values = lower_layer.max_layer_size // 2
+    # having more constants than the conv result size will guarantee that we
+    # can always promote a constant up to the higher layer. The conv shape
+    # size is always odd (because it's an even number divided by 2). We
+    # should use another odd number for the constant size, that way the sum
+    # of the two will be even.
+    num_constants = max_conv_values + 2
 
-        # having more constants than the conv result size will guarantee that we
-        # can always promote a constant up to the higher layer. The conv shape
-        # size is always odd (because it's an even number divided by 2). We
-        # should use another odd number for the constant size, that way the sum
-        # of the two will be even.
-        num_constants = max_conv_values + 2
+    # TODO: IndexSlices is similar what we're trying to do here. A list of
+    # indices and a list of values. Maybe should use that here instead of
+    # the two separate variables
 
-        # TODO: IndexSlices is similar what we're trying to do here. A list of
-        # indices and a list of values. Maybe should use that here instead of
-        # the two separate variables
+    # Ugh, really stupid bug with fill here. Can't mix dimenions and
+    # integers so we need to get the value of the dimension.
+    # Setting constants to 0 instead of nan because we need at least the
+    # first value to be 0 to fix the stupid junk gradient bug
+    constants = tf.Variable(tf.fill([num_constants.value, num_output_channels],
+        np.float32(0)), trainable=False, name="consts")
 
-        # Ugh, really stupid bug with fill here. Can't mix dimenions and
-        # integers so we need to get the value of the dimension.
-        # Setting constants to 0 instead of nan because we need at least the
-        # first value to be 0 to fix the stupid junk gradient bug
-        constants = tf.Variable(tf.fill([num_constants.value, num_output_channels],
-            np.float32(0)), trainable=False, name="consts")
+    # Ugh, really stupid bug with fill here. Can't mix dimenions and
+    # integers so we need to get the value of the dimension.
+    const_ind_init = tf.fill([num_constants.value - 1], np.int32(-1))
+    # Starting with a const value (so plus the lower value, the two values
+    # will go up a layer to be convolved) prevents a nasty bug when
+    # convolutions have 0 outputs (and maybe evaluated conditionally or
+    # something) and going through a dynamic stitch. I dunno but it seemed
+    # to be reading junk data into the gradient. 
+    const_ind_init = tf.concat([tf.zeros([1], tf.int32), const_ind_init], 0)
+    const_indices = tf.Variable(const_ind_init,
+        trainable=False, name="const_indices")
+    del const_ind_init
+    # Starting with the lower layer always having a 0 come up to prevent
+    # the nasty bug described above so that goes in the 1st index
+    # Ugh, really stupid bug with fill here. Can't give dimension arguments
+    conv_ind_init = tf.fill([max_conv_values.value - 1], np.int32(-1))
+    conv_ind_init = tf.concat([tf.ones([1], tf.int32), conv_ind_init], 0)
+    conv_indices = tf.Variable(conv_ind_init, trainable=False,
+        name="conv_indices")
+    del conv_ind_init
 
-        self.constants = constants # TODO delete
+    reset = tf.group(constants.initializer, const_indices.initializer,
+        conv_indices.initializer)
 
-        # Ugh, really stupid bug with fill here. Can't mix dimenions and
-        # integers so we need to get the value of the dimension.
-        const_ind_init = tf.fill([num_constants.value - 1], np.int32(-1))
-        # Starting with a const value (so plus the lower value, the two values
-        # will go up a layer to be convolved) prevents a nasty bug when
-        # convolutions have 0 outputs (and maybe evaluated conditionally or
-        # something) and going through a dynamic stitch. I dunno but it seemed
-        # to be reading junk data into the gradient. 
-        const_ind_init = tf.concat([tf.zeros([1], tf.int32), const_ind_init], 0)
-        const_indices = tf.Variable(const_ind_init,
-            trainable=False, name="const_indices")
-        del const_ind_init
-        # Starting with the lower layer always having a 0 come up to prevent
-        # the nasty bug described above so that goes in the 1st index
-        # Ugh, really stupid bug with fill here. Can't give dimension arguments
-        conv_ind_init = tf.fill([max_conv_values.value - 1], np.int32(-1))
-        conv_ind_init = tf.concat([tf.ones([1], tf.int32), conv_ind_init], 0)
-        conv_indices = tf.Variable(conv_ind_init, trainable=False,
-            name="conv_indices")
-        del conv_ind_init
+    max_layer_size = constants.get_shape()[0] + max_conv_values
 
-        self.reset = tf.group(constants.initializer, const_indices.initializer,
-            conv_indices.initializer)
+    assert max_layer_size % 2 == 0, ("Output size", str(max_layer_size),
+        "should be even for clean convolutions")
 
-        self.const_indices = const_indices #TODO: delete
+    # Each layer will alternate between having 1 or 0 extra values that are
+    # sliced out of the stitch to feed to the upper layer (so the result is
+    # an even number) but are then sent sideways to be used in the bridge.
 
-        self.conv_indices = conv_indices #TODO: delete
+    def not_neg_one(op):
+        # filter out -1 values of op
+        return tf.logical_not(tf.equal(op, -1))
 
-        self.max_layer_size = constants.get_shape()[0] + max_conv_values
+    result_const_positions = not_neg_one(const_indices)
+    result_conv_positions  = not_neg_one(conv_indices )
 
-        assert self.max_layer_size % 2 == 0, ("Output size",
-            str(self.max_layer_size),
-            "should be even for clean convolutions")
+    result_const_indices = tf.boolean_mask(const_indices, result_const_positions)
+    result_conv_indices  = tf.boolean_mask(conv_indices , result_conv_positions )
 
-        # Each layer will alternate between having 1 or 0 extra values that are
-        # sliced out of the stitch to feed to the upper layer (so the result is
-        # an even number) but are then sent sideways to be used in the bridge.
+    def assert_proper_indices():
+        return [tf.Assert(tf.equal(tf.shape(conv)[0],
+            tf.shape(tf.where(result_conv_positions))[0]),
+            [tf.shape(conv), conv_indices], 6)]
 
-        def not_neg_one(op):
-            # filter out -1 values of op
-            return tf.logical_not(tf.equal(op, -1))
+    values = with_assert(lambda: [
+            tf.boolean_mask(constants, result_const_positions), 
+            tf.boolean_mask(conv     , result_conv_positions )],
+            assert_proper_indices)
 
-        result_const_positions = not_neg_one(const_indices)
-        result_conv_positions = not_neg_one(conv_indices)
+    indices = [result_const_indices, result_conv_indices]
 
-        assert_proper_indices = tf.Assert(
-            tf.equal(tf.shape(conv)[0], tf.shape(tf.where(result_conv_positions))[0]),
-            [conv, conv_indices], 6)
+    def assert_unique_indices():
+        # unique returns 2 things
+        unique_indices = tf.unique(tf.concat(indices, 0))[0]
+        unique_shape = tf.shape(unique_indices)[0]
+        return [tf.Assert(tf.equal(
+            tf.shape(indices[0])[0] + tf.shape(indices[1])[0], unique_shape),
+            indices + [unique_shape, unique_indices], 6)]
 
-        with tf.control_dependencies([assert_proper_indices]):
-            values = [tf.boolean_mask(constants, result_const_positions), 
-                      tf.boolean_mask(conv     , result_conv_positions)]
-        indices = [tf.boolean_mask(const_indices, result_const_positions),
-                   tf.boolean_mask(conv_indices , result_conv_positions)]
+    stitch = with_assert(lambda: tf.dynamic_stitch(indices, values),
+        assert_unique_indices)
 
-        all_indices = tf.concat(indices, 0)
+    num_results_is_odd = is_odd(tf.shape(stitch)[0])
 
-        assert_unique_indices = tf.Assert(tf.equal(tf.shape(all_indices)[0],
-            tf.shape(tf.unique(all_indices)[0])[0]), indices, 6)
+    # If we have an odd number of results, don't push the last one up. It
+    # will be bridged.
+    result_op = tf.cond(num_results_is_odd, lambda: stitch[0:-1],
+        lambda: stitch)
 
-        with tf.control_dependencies([assert_unique_indices]):
-            stitch = tf.dynamic_stitch(indices, values)
+    def bridge_with_lower_layer():
+        return tf.layers.dense(
+            # Expand dims to make a fake mini-batch
+            inputs = tf.expand_dims(tf.concat([lower_layer.bridge_val,
+                stitch[-1]], 0), 0),
+            units = num_output_channels, # could be different
+            activation = tf.tanh
+            # should default to xavier_initializer
+            # should default to 0 initialized bias
+            )[0] # extract single value of fake mini batch
 
-        self.num_results = tf.shape(stitch)[0]
+    def pass_up_lower_layer():
+        if lower_layer.bridge_val.shape == [num_output_channels]:
+            return lower_layer.bridge_val
+        # Just do a linear dimensionality change if they don't match
+        return tf.layers.dense(
+            # Expand dims to make a fake mini-batch
+            inputs = tf.expand_dims(lower_layer.bridge_val, 0),
+            units = num_output_channels, # could be different
+            activation = None,
+            # should default to xavier_initializer
+            # should default to 0 initialized bias
+            )[0] # extract single value of fake mini batch
 
-        num_results_is_odd = tf.equal(self.num_results % 2, 1)
+    bridge_val = tf.cond(num_results_is_odd, bridge_with_lower_layer,
+        pass_up_lower_layer)
 
-        # If we have an odd number of results, don't push the last one up. It
-        # will be bridged.
-        self.result_op = tf.cond(num_results_is_odd, lambda: stitch[0:-1],
-            lambda: stitch)
+    del stitch
 
-        def bridge_with_lower_layer():
-            return tf.layers.dense(
-                # Expand dims to make a fake mini-batch
-                inputs = tf.expand_dims(tf.concat([lower_layer.bridge_val,
-                    stitch[-1]], 0), 0),
-                units = num_output_channels, # could be different
-                activation = tf.tanh
-                # should default to xavier_initializer
-                # should default to 0 initialized bias
-                )[0] # extract single value of fake mini batch
+    # super ugly but it's hard to do enums/ADTs in tensorflow so -2 means no new
+    # input vales. -1 means new input but no new promoted values, and an actual
+    # index means that's the promoted index and the second arg won't be junk
+    lower_layer_promoted_index, lower_layer_promoted_values = lower_layer.push_op
 
-        def pass_up_lower_layer():
-            if lower_layer.bridge_val.shape == [num_output_channels]:
-                return lower_layer.bridge_val
-            # Just do a linear dimensionality change if they don't match
-            return tf.layers.dense(
-                # Expand dims to make a fake mini-batch
-                inputs = tf.expand_dims(lower_layer.bridge_val, 0),
-                units = num_output_channels, # could be different
-                activation = None,
-                # should default to xavier_initializer
-                # should default to 0 initialized bias
-                )[0] # extract single value of fake mini batch
-
-        self.bridge_val = tf.cond(num_results_is_odd, bridge_with_lower_layer,
-            pass_up_lower_layer)
-
-        del stitch
-
-        self.had_odd_results_before = tf.placeholder(shape=[], dtype=tf.bool)
+    def absorb_new_result():    
 
         def update_new_conv_index():
-            new_conv_pos = tf.shape(conv)[0] - 1
+            # The position of the new conv value will be however many indices
+            # we already had plus one
+            new_conv_pos = tf.shape(result_conv_indices)[0]
             # Don't want to evaluate stitch directly here because the conv indices
             # and values currently don't match until we do the update.
             # Not plus one because 0 based indices
             new_result_index = tf.shape(indices[0])[0] + tf.shape(indices[1])[0]
 
-            free_conv_space = tf.Assert(tf.equal(conv_indices[new_conv_pos], -1),
-                [conv_indices])
-            actually_a_new_conv_value = tf.Assert(
-                tf.equal(tf.shape(tf.where(result_conv_positions))[0], tf.shape(conv)[0] - 1),
-                [conv, conv_indices], 6)
+            def conv_asserts():
+                enough_indices = tf.Assert(
+                    tf.less(new_conv_pos, tf.shape(conv_indices)[0]),
+                    [new_conv_pos, conv_indices])
+                free_conv_space = tf.Assert(
+                    tf.equal(conv_indices[new_conv_pos], -1),
+                    [conv_indices])
+                return [enough_indices, free_conv_space]
 
-            with tf.control_dependencies([free_conv_space, actually_a_new_conv_value]):
-                update_new_conv_index = conv_indices[new_conv_pos].assign(
-                    new_result_index)
+            update_new_conv_index = with_assert(lambda: conv_indices[new_conv_pos].assign(
+                new_result_index), conv_asserts)
+
             junk = tf.fill([2, num_output_channels], np.float32(np.nan))
 
             with tf.control_dependencies([update_new_conv_index]):
-                # If we had an odd number of results before, than the 2 new values
-                # from the lower layer will become 1 new conv result which will,
-                # along with the previous bridged only value, be returned up from
-                # this layer as 2 new values.
-                return tf.cond(self.had_odd_results_before,
+                # If we have an even number of results (which happens when the
+                # new index is odd, than the 2 new values from the lower layer
+                # will become 1 new conv result which will, along with the
+                # previous bridged only value, be returned up from this layer
+                # as 2 new values.
+                return tf.cond(is_odd(new_result_index),
                     lambda: tf.constant(-1), lambda: tf.constant(-2)), junk
-
-        self.lower_layer_promoted_index = tf.placeholder(tf.int32, shape=[])
-        self.lower_layer_promoted_values = tf.placeholder(tf.float32, shape=[2,
-            num_input_channels])
 
         def insert_lower_promoted_then_promote():
             # we can't just use the lower layer result op and slice on the index
             # because the lower layer has already deleted those values and shifted
             # it's own indices
-            assert_even = tf.Assert(tf.equal(self.lower_layer_promoted_index % 2, 0),
-                [self.lower_layer_promoted_index])
-            with tf.control_dependencies([assert_even]):
-                new_const_conv_position = self.lower_layer_promoted_index // 2
+            def assert_even():
+                return [tf.Assert(tf.equal(lower_layer_promoted_index % 2, 0),
+                    [lower_layer_promoted_index])]
+
+            new_const_conv_position = with_assert(
+                lambda: lower_layer_promoted_index // 2, assert_even)
             # we're passing in two values to this convolution so we should be
             # extracting the only value with [0]
-            new_const_value = extract_singleton(self.make_conv_op(
-                self.lower_layer_promoted_values))
+            new_const_value = extract_singleton(make_conv_op(
+                lower_layer_promoted_values))
             new_const_index = conv_indices[new_const_conv_position]
-
-            valid_promote_index = tf.Assert(tf.logical_not(tf.equal(new_const_index, -1)),
-                [new_const_index])
 
             # Only casting to int32 because tf.where doesn't take a dtype argument
             # for some reason
@@ -281,10 +284,8 @@ class Layer:
 
             def simple_insert():
                 slot = empty_slots[0] # get one of many empty slots
-                assignments = [
-                    valid_promote_index,
-                    constants    [slot].assign(new_const_value),
-                    const_indices[slot].assign(new_const_index)]
+                assignments = [constants    [slot].assign(new_const_value),
+                               const_indices[slot].assign(new_const_index)]
 
                 with tf.control_dependencies([new_const_index]):
                     ident_conv = tf.identity(conv_indices)
@@ -310,11 +311,11 @@ class Layer:
                 # found them
                 ci_pos_1 = tf.range(1, tf.shape(const_indices)[0] + 1, dtype=tf.int32)
 
-                assert self.max_layer_size % 2 == 0, "Reshape will be weird"
+                assert max_layer_size % 2 == 0, "Reshape will be weird"
                 to_find_pairs = tf.reshape(
                     tf.scatter_nd(tf.reshape(const_indices, [-1, 1]), ci_pos_1,
                     # ugh, another place that should just accept a dimension
-                    [self.max_layer_size.value]), [-1, 2])
+                    [max_layer_size.value]), [-1, 2])
 
                 is_const_pair = tf.logical_and(
                     tf.logical_not(tf.equal(to_find_pairs[:,0], 0)), 
@@ -322,27 +323,28 @@ class Layer:
 
                 found_pairs = tf.boolean_mask(to_find_pairs, is_const_pair)
 
-                assert_found = tf.Assert(tf.shape(found_pairs)[0] > 0,
-                    [const_indices, to_find_pairs])
-                # Should find at least 1 pair by pigeonhole principle
-                with tf.control_dependencies([assert_found]):
-                    # need to subtract 1 because we added 1 to positions above
-                    found = found_pairs[0] - 1
+                def assert_found():
+                    # Should find at least 1 pair by pigeonhole principle
+                    return [tf.Assert(tf.shape(found_pairs)[0] > 0,
+                        [const_indices, to_find_pairs])]
+                # need to subtract 1 because we added 1 to positions above
+                found = with_assert(lambda: found_pairs[0] - 1, assert_found)
 
                 const_to_promote = tf.gather(constants, found)
 
-                assert_adjacent = tf.Assert(tf.equal(
-                    const_indices[found[1]], const_indices[found[0]] + 1),
-                    [const_indices, found])
-                with tf.control_dependencies([assert_adjacent]):
-                    const_index_to_p = const_indices[found[0]]
+                def assert_adjacent():
+                    return [tf.Assert(tf.equal(
+                        const_indices[found[1]], const_indices[found[0]] + 1),
+                        [const_indices, found])]
+                const_index_to_p = with_assert(lambda: const_indices[found[0]],
+                     assert_adjacent)
 
                 with tf.control_dependencies([const_to_promote]):
                     const_update = tf.scatter_update(constants, found,
                         [new_const_value, tf.fill([num_output_channels],
                             np.float32(np.nan))])
 
-                with tf.control_dependencies([const_index_to_p, valid_promote_index]):
+                with tf.control_dependencies([const_index_to_p]):
                     move_index_from_conv_to_const = tf.scatter_update(const_indices,
                          found, [new_const_index, -1])
 
@@ -369,10 +371,13 @@ class Layer:
                 # don't need to also return it. Just the one to promote index
                 return shift_conv_indices, const_index_to_promote, const_to_promote
 
+            def valid_promote_index():
+                return [tf.Assert(tf.logical_not(tf.equal(new_const_index, -1)),
+                    [new_const_index])]
             # shifted_conv is to ensure correct write dependencies on conv_indices
-            shifted_conv, promote_index, promote_value = tf.cond(
-                tf.equal(tf.shape(empty_slots)[0], 0),
-                insert_and_promote, simple_insert)
+            shifted_conv, promote_index, promote_value = with_assert(lambda:
+                tf.cond(tf.equal(tf.shape(empty_slots)[0], 0),
+                insert_and_promote, simple_insert), valid_promote_index)
 
             # we need to move the new const value first before trimming out its
             # index here
@@ -387,34 +392,27 @@ class Layer:
             with tf.control_dependencies([conv_indices_inc]):
                 return tf.identity(promote_index), tf.identity(promote_value)
 
-        self.insert_lower_promoted_if_exists_then_promote = tf.cond(
+        return tf.cond(
             # -1 means new value but not promote
-            tf.equal(self.lower_layer_promoted_index, -1),
+            tf.equal(lower_layer_promoted_index, -1),
             update_new_conv_index, # If there is no promoted value
             insert_lower_promoted_then_promote)
 
-    # super ugly but it's hard to do enums/ADTs in tensorflow so -2 means no new
-    # input vales. -1 means new input but no new promoted values, and an actual
-    # index means that's the promoted index and the second arg won't be junk
-    def push_input(self, char, sess):
+    with tf.control_dependencies([lower_layer_promoted_values]):
+        junk = tf.fill([2, num_output_channels], np.float32(np.nan))
 
-        # evaluated before recursing
-        had_odd_results_before = sess.run(self.num_results) % 2 == 1
+        push_op = tf.cond(tf.equal(lower_layer_promoted_index, -2),
+            lambda: (tf.constant(-2), junk), absorb_new_result)
 
-        rec_res = self.push_f(char, sess)
-        if rec_res[0] == -2: # This means there are no new result values
-            return -2, np.full([2, self.num_output_channels], np.float32(np.nan))
+    class Layer:
+        def __init__(self):
+            self.reset = reset
+            self.max_layer_size = max_layer_size
+            self.result_op = result_op
+            self.bridge_val = bridge_val
+            self.push_op = push_op
 
-        # else, there are new values from the below layer and we need to add
-        # indices for them
-
-        update_index, update_values = rec_res
-
-        inj = {  self.had_odd_results_before : had_odd_results_before,
-            self.lower_layer_promoted_index : update_index,
-            self.lower_layer_promoted_values : update_values }
-
-        return sess.run(self.insert_lower_promoted_if_exists_then_promote, inj)
+    return Layer()
 
 class Input:
     def __init__(self, num_constants):
@@ -434,13 +432,27 @@ class Input:
              c_init], axis=0)
         constants = tf.Variable(c_init, trainable=False)
 
-        self.constants = constants # XXX TODO: delete
-
         self.reset = tf.group(write_head.initializer, constants.initializer)
 
         self.max_layer_size = constants.get_shape()[0]
 
         self.new_char = tf.placeholder(tf.float32, shape=[input_channels])
+
+        non_nan_values = constants[0 : write_head]
+
+        num_results_is_odd = tf.equal(tf.shape(non_nan_values)[0] % 2, 1)
+        # If we have an odd number of results, don't push the last one up. It
+        # will be bridged.
+        self.result_op = tf.cond(num_results_is_odd, 
+            lambda: non_nan_values[0:-1], lambda: non_nan_values)
+
+        # Bridge the value that is not included
+        self.bridge_val = tf.cond(num_results_is_odd, lambda: non_nan_values[-1],
+            lambda: tf.zeros([input_channels], tf.float32)) 
+
+        assert self.max_layer_size % 2 == 0, ("Output size",
+            str(self.max_layer_size),
+            "should be even for clean convolutions")
 
         def simple_add_input():
             write_input = constants[write_head].assign(self.new_char)
@@ -482,55 +494,37 @@ class Input:
             # return the removed index and values
             return random_index, rem_values
 
-        self.push = tf.cond(write_head < self.max_layer_size,
+        self.push_op = tf.cond(write_head < self.max_layer_size,
             simple_add_input, remove_2_values)
 
-        non_nan_values = constants[0 : write_head]
+lowest_level_memory_size = 10
 
-        num_results_is_odd = tf.equal(tf.shape(non_nan_values)[0] % 2, 1)
-        # If we have an odd number of results, don't push the last one up. It
-        # will be bridged.
-        self.result_op = tf.cond(num_results_is_odd, 
-            lambda: non_nan_values[0:-1], lambda: non_nan_values)
+import math
 
-        # Bridge the value that is not included
-        self.bridge_val = tf.cond(num_results_is_odd, lambda: non_nan_values[-1],
-            lambda: tf.zeros([input_channels], tf.float32)) 
-
-        assert self.max_layer_size % 2 == 0, ("Output size",
-            str(self.max_layer_size),
-            "should be even for clean convolutions")
-
-    def push_input(self, char, sess):
-
-        return sess.run(self.push, { self.new_char : char })
-
-layer_channels = 2 #TODO: can vary per layer
-
-lowest_level_memory_size = 6
-
-num_layers = 6 # TODO: can this be dynamic and grow with more input?
+max_len = max(len(book) for book in lb.train_books)
+# TODO: can this be dynamic and grow with more input?
+num_layers = int(math.ceil(math.log2(max_len)))
+print("Max book length", max_len, "so number of layers is", num_layers)
 
 resets = []
 
-with tf.get_default_graph().name_scope("input_layer"):
+with tf.name_scope("input_layer"):
     layer = Input(lowest_level_memory_size)
 input_layer = layer
 resets.append(layer.reset)
 
-conv_indices = []
-const_indices = []
-constants = [input_layer.constants]
-convs = []
+layer_channels = 5
+
+memory_scale_factor = 1.3
 
 for i in range(num_layers):
-    with tf.get_default_graph().name_scope("layer_" + str(i)):
-        layer = Layer(layer, layer_channels)
+    with tf.name_scope("layer_" + str(i)):
+        layer = make_layer(layer, layer_channels)
     resets.append(layer.reset)
-    conv_indices.append(layer.conv_indices)
-    const_indices.append(layer.const_indices)
-    constants.append(layer.constants)
-    convs.append(layer.conv)
+
+    print("Layer", i, "has", layer_channels, "output channels.")
+
+    layer_channels = int(math.ceil(layer_channels * memory_scale_factor))
 
 output = tf.layers.dense(
     # Expand dims to make a fake mini-batch
@@ -578,70 +572,61 @@ num_predictions = sum(len(book) - 1 for book in lb.train_books)
 accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
 apply_grads = optimizer.apply_gradients(zip(acc_gs, vars))
 
-epochs = 100
+epochs = 5
+
+import collections
+import re
+
+def train_book(sess, book):
+    sess.run(resets)
+
+    book_loss = 0
+
+    # TODO: reduce maxlen to terminal width if smaller
+    book_buffer = collections.deque(maxlen = 80) 
+    predict_buffer = collections.deque(maxlen = 80)
+
+    book_buffer.append(book[0])
+    predict_buffer.append(book[0]) # we don't actually predict the first char
+
+    print("Book length:", len(book), "\n\n")
+
+    for progress, (char, next_char) in enumerate(zip(book[:-1], book[1:])):
+        # one hot returns as a 2D batch but we're feeding in 1 at a time
+        sess.run(layer.push_op, { input_layer.new_char : lb.one_hot(char)[0] }) 
+
+        inj = { target : lb.char_indices[next_char] }
+        char_loss, predict, _ = sess.run(
+            [loss, output, accumulate_gradients], inj)
+
+        def simplify_whitespace(s):
+            return re.sub(r"\s", " ", s)
+
+        book_loss += char_loss
+
+        book_buffer.append(simplify_whitespace(next_char))
+        predict_buffer.append(
+            simplify_whitespace(lb.index_chars[np.argmax(predict)]))
+
+        print("\033[F\033[F", "".join(book_buffer), sep='')
+        print("".join(predict_buffer), end=' ')
+        print("%3.2f%%" % ((progress / len(book)) * 100))
+
+    print("Loss", book_loss)
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
     for epoch in range(epochs):
-        print("Epoch", epoch)
+        print("Epoch", epoch, "\n")
 
         sess.run([acc_g.initializer for acc_g in acc_gs])
 
         for book in lb.train_books:
-
-            sess.run(resets)
-
-            predict_book = book[0]
-            book_loss = 0
-
-            for char, next_char in zip(book[:-1], book[1:]):
-                # one hot returns as a 2D batch but we're feeding in 1 at a time
-                layer.push_input(lb.one_hot(char)[0], sess) 
-
-                inj = { target : lb.char_indices[next_char] }
-                char_loss, predict, _ = sess.run([loss, output, accumulate_gradients], inj)
-
-#                if epoch == epochs - 1:
-#                    print(predict)
-
-                def print_array(array):
-                    print("\n".join(str(val) for val in array))
-
-                prnt = False
-
-                if prnt and epoch == epochs - 1:
-                    print("Constants")
-                    print_array(sess.run(constants))
-
-                if prnt and epoch == epochs - 1:
-                    print("Convs")
-                    print_array(sess.run(convs))
-
-                if prnt and epoch == epochs - 1:
-                    print("Const Indices")
-                    print_array(sess.run(const_indices))
-
-                if prnt and epoch == epochs - 1:
-                    print("Conv Indices")
-                    print_array(sess.run(conv_indices))
-
-                assert not np.isnan(char_loss)
-
-                predict_book += (lb.index_chars[np.argmax(predict)])
-                book_loss += char_loss
-
-            print(book)
-            print(predict_book, "-", book_loss)
+            train_book(sess, book)
 
         sess.run(apply_grads)
 
-#        if epoch % (epochs / 20) == 0 or epoch == epochs - 1: #epochs - 1 is last one
-#            write_summaries.add_summary(sess.run(all_summaries), epoch)
-
-        vars = [v for g, v in grads_and_vars]
-        #print("Grads", "\n".join(str((v.name, val)) for v, val in zip(vars, acc_gs)))
-        #print("Weights", [(v.name, val) for v, val in zip(vars, sess.run(vars))])
-        #print("Input", sess.run(input_layer.constants))
-        #print("Conv", "\n".join(str(i) for i in sess.run(conv_indices)))
-        #print("Const", "\n".join(str(i) for i in sess.run(const_indices)))
+        #epochs - 1 is last one
+        if epoch % (epochs / 20) == 0 or epoch == epochs - 1:
+            write_summaries.add_summary(sess.run(all_summaries), epoch)
