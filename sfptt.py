@@ -74,10 +74,47 @@ def extract_singleton(op):
 def is_odd(op):
     return tf.equal(op % 2, 1)
 
-def make_layer(lower_layer, num_output_channels):
-    def make_weights(name, shape):
-        init = tf.contrib.layers.xavier_initializer(dtype=tf.float32)
-        return tf.Variable(init(shape), name=name + "_weights")
+def make_conv_op(input, filter_weights, filt_bias):
+    # Need to add a fake batch dimension because all the conv functions
+    # assume you are using batches. Likewise we need to extract our "batch"
+    filt = extract_singleton(tf.nn.conv1d(tf.expand_dims(input, 0),
+         filter_weights, 2, 'SAME'))
+
+    return tf.tanh(tf.add(filt, filt_bias))
+
+def make_bridge_op(result, num_results_is_odd, bridge_channels, lower_layer_bridge_val):
+    def bridge_with_lower_layer():
+        return tf.layers.dense(
+            # Expand dims to make a fake mini-batch
+            inputs = tf.expand_dims(tf.concat([lower_layer_bridge_val,
+                result[-1]], 0), 0),
+            units = bridge_channels,
+            activation = tf.tanh
+            # should default to xavier_initializer
+            # should default to 0 initialized bias
+            )[0] # extract single value of fake mini batch
+
+    def pass_up_lower_layer():
+        if lower_layer_bridge_val.shape == [bridge_channels]:
+            return lower_layer_bridge_val
+        # Just do a linear dimensionality change if they don't match
+        return tf.layers.dense(
+            # Expand dims to make a fake mini-batch
+            inputs = tf.expand_dims(lower_layer_bridge_val, 0),
+            units = bridge_channels,
+            activation = None,
+            # should default to xavier_initializer
+            # should default to 0 initialized bias
+            )[0] # extract single value of fake mini batch
+
+    return tf.cond(num_results_is_odd, bridge_with_lower_layer,
+        pass_up_lower_layer)
+
+def make_weights(name, shape):
+    init = tf.contrib.layers.xavier_initializer(dtype=tf.float32)
+    return tf.Variable(init(shape), name=name + "_weights")
+
+def make_simple_layer(lower_layer, num_output_channels):
 
     # First dimension is what we conv over, 2nd is number of channels
     # Btw, .value fixes a really stupid bug with xavier_init because it
@@ -89,25 +126,89 @@ def make_layer(lower_layer, num_output_channels):
     filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
         dtype=tf.float32), name="filter_baises")
 
-    def make_conv_op(input):
-        # Need to add a fake batch dimension because all the conv functions
-        # assume you are using batches. Likewise we need to extract our "batch"
-        filt = extract_singleton(tf.nn.conv1d(tf.expand_dims(input, 0),
-             filter_weights, 2, 'SAME'))
+    #ugh dumb hack around nasty bug
+    lower_layer_result = tf.concat([np.zeros([2, num_input_channels]), lower_layer.result_op], 0)
+    conv = make_conv_op(lower_layer_result, filter_weights, filt_bias)[1:] # slice off hack
 
-        return tf.tanh(tf.add(filt, filt_bias))
+    num_results_is_odd = is_odd(tf.shape(conv)[0])
 
-    conv = make_conv_op(lower_layer.result_op)
+    # If we have an odd number of results, don't push the last one up. It
+    # will be bridged.
+    result_op = tf.cond(num_results_is_odd, lambda: conv[0:-1],
+        lambda: conv)
+
+    assert lower_layer.max_layer_size % 2 == 0
+    max_layer_size = (lower_layer.max_layer_size // 2)
+    # max layer size is when there is no bridge. We can actually set the max
+    # size to be more than it will ever be in order to fulfill that definition
+    # because layers are always allowed to have fewer results than their max.
+    if max_layer_size % 2 == 1:
+        max_layer_size += 1
+
+    assert max_layer_size % 2 == 0, str((lower_layer.max_layer_size, max_layer_size))
+
+    class Layer:
+        def __init__(self):
+            self.reset = tf.no_op()
+            self.max_layer_size = max_layer_size
+            self.result_op = result_op
+            self.bridge_val = make_bridge_op(
+                conv,
+                num_results_is_odd,
+                num_output_channels, # could be different
+                lower_layer.bridge_val)
+
+            # Even though we read this value more than once when the assert is
+            # on, TF won't execute the op more than once.
+            lower_push = lower_layer.push_op
+
+            def assert_no_promote():
+                return [tf.Assert(lower_push[0] < 0, [lower_push])]
+
+            self.push_op = with_assert(lambda: lower_push, assert_no_promote)
+
+    return Layer()
+
+def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
 
     assert lower_layer.max_layer_size % 2 == 0
     max_conv_values = lower_layer.max_layer_size // 2
 
-    # having more constants than the conv result size will guarantee that we
-    # can always promote a constant up to the higher layer. The conv shape
-    # size is always odd (because it's an even number divided by 2). We
-    # should use another odd number for the constant size, that way the sum
-    # of the two will be even.
-    num_constants = max_conv_values + 2
+    # if the convolution values and the bridge are enough to cover the entire
+    # input length then we can create a layer that doesn't need constants
+    if max_conv_values >= max_outputs_for_dataset:
+        return make_simple_layer(lower_layer, num_output_channels)
+
+    # First dimension is what we conv over, 2nd is number of channels
+    # Btw, .value fixes a really stupid bug with xavier_init because it
+    # doesn't auto convert the dimension to an integer
+    num_input_channels = lower_layer.result_op.get_shape()[1].value
+
+    filter_weights = make_weights("filter",
+        [2, num_input_channels, num_output_channels])
+    filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
+        dtype=tf.float32), name="filter_baises")
+
+    def make_local_conv_op(input):
+        return make_conv_op(input, filter_weights, filt_bias)
+
+    conv = make_local_conv_op(lower_layer.result_op)
+
+    # Having more constants than the conv result size will guarantee that we
+    # can always promote a constant up to the higher layer.
+    # However, we don't need to ever promote if the max conv values + the
+    # number of constants is less than 'max_outputs_for_dataset'
+    extra_constants_for_dataset = max(
+        # Make sure this isn't less than 1 because we currently have that hack
+        # where we start with a 0 in the constants.
+        tf.Dimension(max_outputs_for_dataset) - max_conv_values, 1)
+    # The conv shape size may be odd. If so we should use another odd number
+    # for the constant size, that way the sum of the two will be even.
+    if max_conv_values % 2 != extra_constants_for_dataset % 2:
+        extra_constants_for_dataset += 1
+    num_constants = min(extra_constants_for_dataset, max_conv_values + 2)
+
+    del extra_constants_for_dataset
 
     # TODO: IndexSlices is similar what we're trying to do here. A list of
     # indices and a list of values. Maybe should use that here instead of
@@ -147,7 +248,8 @@ def make_layer(lower_layer, num_output_channels):
     max_layer_size = constants.get_shape()[0] + max_conv_values
 
     assert max_layer_size % 2 == 0, ("Output size", str(max_layer_size),
-        "should be even for clean convolutions")
+        "should be even for clean convolutions", constants.get_shape()[0],
+        max_conv_values)
 
     # Each layer will alternate between having 1 or 0 extra values that are
     # sliced out of the stitch to feed to the upper layer (so the result is
@@ -193,32 +295,9 @@ def make_layer(lower_layer, num_output_channels):
     result_op = tf.cond(num_results_is_odd, lambda: stitch[0:-1],
         lambda: stitch)
 
-    def bridge_with_lower_layer():
-        return tf.layers.dense(
-            # Expand dims to make a fake mini-batch
-            inputs = tf.expand_dims(tf.concat([lower_layer.bridge_val,
-                stitch[-1]], 0), 0),
-            units = num_output_channels, # could be different
-            activation = tf.tanh
-            # should default to xavier_initializer
-            # should default to 0 initialized bias
-            )[0] # extract single value of fake mini batch
-
-    def pass_up_lower_layer():
-        if lower_layer.bridge_val.shape == [num_output_channels]:
-            return lower_layer.bridge_val
-        # Just do a linear dimensionality change if they don't match
-        return tf.layers.dense(
-            # Expand dims to make a fake mini-batch
-            inputs = tf.expand_dims(lower_layer.bridge_val, 0),
-            units = num_output_channels, # could be different
-            activation = None,
-            # should default to xavier_initializer
-            # should default to 0 initialized bias
-            )[0] # extract single value of fake mini batch
-
-    bridge_val = tf.cond(num_results_is_odd, bridge_with_lower_layer,
-        pass_up_lower_layer)
+    bridge_val = make_bridge_op(stitch, num_results_is_odd,
+        num_output_channels, # could be different
+        lower_layer.bridge_val)
 
     del stitch
 
@@ -273,7 +352,7 @@ def make_layer(lower_layer, num_output_channels):
                 lambda: lower_layer_promoted_index // 2, assert_even)
             # we're passing in two values to this convolution so we should be
             # extracting the only value with [0]
-            new_const_value = extract_singleton(make_conv_op(
+            new_const_value = extract_singleton(make_local_conv_op(
                 lower_layer_promoted_values))
             new_const_index = conv_indices[new_const_conv_position]
 
@@ -518,13 +597,24 @@ layer_channels = 5
 memory_scale_factor = 1.3
 
 for i in range(num_layers):
+    # Chunk size should be the number of input characters represented by each
+    # output vector of the layer we are about to create
+    chunk_size = 2 ** (i + 1)
+    # max_chunks is how many we need to represent every character in the
+    # largest example in our dataset, rounded up.
+    max_chunks = max_len // chunk_size + (0 if max_len % chunk_size == 0 else 1)
+
     with tf.name_scope("layer_" + str(i)):
-        layer = make_layer(layer, layer_channels)
+        layer = make_layer(layer, layer_channels, max_chunks)
+        print("Layer", i, "has", layer_channels, "channels and",
+            layer.max_layer_size, "values.")
+
     resets.append(layer.reset)
 
-    print("Layer", i, "has", layer_channels, "output channels.")
-
     layer_channels = int(math.ceil(layer_channels * memory_scale_factor))
+
+print("The final layer says size 2 but only 1 value will ever be computed.",
+    "It just says 2 because every layer has to have a positive even max size")
 
 output = tf.layers.dense(
     # Expand dims to make a fake mini-batch
@@ -547,7 +637,11 @@ optimizer = tf.train.GradientDescentOptimizer(1.0)
 
 grads_and_vars = [(g, v) for g, v in optimizer.compute_gradients(loss) if g is not None]
 
-grads = [tf.check_numerics(g, "grr") for g, _ in grads_and_vars]
+if asserts:
+    grads = [tf.check_numerics(g, "grr") for g, _ in grads_and_vars]
+else:
+    grads = [g for g, _ in grads_and_vars]
+
 vars = [v for _, v in grads_and_vars]
 
 for v in vars:
@@ -572,7 +666,7 @@ num_predictions = sum(len(book) - 1 for book in lb.train_books)
 accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
 apply_grads = optimizer.apply_gradients(zip(acc_gs, vars))
 
-epochs = 5
+epochs = 1
 
 import collections
 import re
@@ -614,8 +708,17 @@ def train_book(sess, book):
 
     print("Loss", book_loss)
 
+checkpoint_dir = "checkpoints"
+# Because we only have to save the weights, we could actually vary the constant
+# sizes between training sessions
+saver = tf.train.Saver(tf.trainable_variables())
+import os
+os.makedirs(checkpoint_dir, exist_ok=True)
+
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
+
+    saver.restore(sess, tf.train.lastest_checkpoint(checkpoint_dir))
 
     for epoch in range(epochs):
         print("Epoch", epoch, "\n")
@@ -627,6 +730,9 @@ with tf.Session() as sess:
 
         sess.run(apply_grads)
 
+        save_path = saver.save(sess, checkpoint_dir, globa_step=epoch)
+        print("Saved to:", save_path)
+
         #epochs - 1 is last one
-        if epoch % (epochs / 20) == 0 or epoch == epochs - 1:
-            write_summaries.add_summary(sess.run(all_summaries), epoch)
+#        if epoch % (epochs / 20) == 0 or epoch == epochs - 1:
+#            write_summaries.add_summary(sess.run(all_summaries), epoch)
