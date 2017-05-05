@@ -708,7 +708,7 @@ def train_book(sess, book):
 
     print("Loss", book_loss)
 
-checkpoint_dir = "checkpoints"
+checkpoint_dir = "checkpoints/"
 # Because we only have to save the weights, we could actually vary the constant
 # sizes between training sessions
 saver = tf.train.Saver(tf.trainable_variables())
@@ -718,7 +718,8 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
-    saver.restore(sess, tf.train.lastest_checkpoint(checkpoint_dir))
+    # seems like this just errors if there are no saved checkpoints
+    saver.restore(sess, tf.train.latest_checkpoint(checkpoint_dir))
 
     for epoch in range(epochs):
         print("Epoch", epoch, "\n")
@@ -730,7 +731,7 @@ with tf.Session() as sess:
 
         sess.run(apply_grads)
 
-        save_path = saver.save(sess, checkpoint_dir, globa_step=epoch)
+        save_path = saver.save(sess, checkpoint_dir + "save", global_step=epoch)
         print("Saved to:", save_path)
 
         #epochs - 1 is last one
