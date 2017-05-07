@@ -15,6 +15,28 @@ import shutil
 np.set_printoptions(threshold=np.nan, 
     linewidth=shutil.get_terminal_size().columns)
 
+import argparse
+
+cmd_arg_def = argparse.ArgumentParser(description="Learn from text")
+
+cmd_arg_def.add_argument("-d", "--debug", help=("Make it easier to catch errors"
+    "in the tensorflow implementation"), action="store_true")
+
+cmd_arg_def.add_argument("-e", "--epochs", metavar='number_of_epochs', type=int,
+    default=100, help="Number of training epochs")
+
+cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
+    type=int, required=True, help="Number of dimensons of the first layer above"
+    " the input.")
+
+cmd_arg_def.add_argument("-f", "--dim_scale", metavar='channel_scale_factor',
+    type=float, required=True, help=("The factor of change of dimensons between"
+    " layers. Should be between 1 and 2. Anything more than 2 will be trying to"
+    " add information that isn't there. Anything less than 1 is probably losing"
+    "  almost all of the information."))
+
+cmd_args = cmd_arg_def.parse_args()
+
 # Several layers that have some constant indexed values and some indexed values
 # from the lower layer. The bottom input layer is all constants.
 
@@ -57,10 +79,8 @@ np.set_printoptions(threshold=np.nan,
 # break our principle of the result of a tree not changing at each new timestep
 # allowing up to save it into a constant.
 
-asserts = False
-
 def with_assert(op_factory, assert_factory):
-    if asserts:
+    if cmd_args.debug:
         with tf.control_dependencies(assert_factory()):
             return op_factory()
     return op_factory()
@@ -592,9 +612,9 @@ with tf.name_scope("input_layer"):
 input_layer = layer
 resets.append(layer.reset)
 
-layer_channels = 5
+layer_channels = cmd_args.base_dims
 
-memory_scale_factor = 1.3
+memory_scale_factor = cmd_args.dim_scale
 
 for i in range(num_layers):
     # Chunk size should be the number of input characters represented by each
@@ -637,7 +657,7 @@ optimizer = tf.train.GradientDescentOptimizer(1.0)
 
 grads_and_vars = [(g, v) for g, v in optimizer.compute_gradients(loss) if g is not None]
 
-if asserts:
+if cmd_args.debug:
     grads = [tf.check_numerics(g, "grr") for g, _ in grads_and_vars]
 else:
     grads = [g for g, _ in grads_and_vars]
@@ -665,8 +685,6 @@ num_predictions = sum(len(book) - 1 for book in lb.train_books)
 # dividing gradients before summing should prevent overflows here
 accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
 apply_grads = optimizer.apply_gradients(zip(acc_gs, vars))
-
-epochs = 50
 
 import collections
 import re
@@ -722,6 +740,8 @@ with tf.Session() as sess:
     saver.restore(sess, tf.train.latest_checkpoint(checkpoint_dir))
 
     lowest_loss_so_far = math.inf
+
+    epochs = cmd_args.epochs
 
     for epoch in range(epochs):
         print("Epoch", epoch, "\n")
