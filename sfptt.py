@@ -666,7 +666,7 @@ num_predictions = sum(len(book) - 1 for book in lb.train_books)
 accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
 apply_grads = optimizer.apply_gradients(zip(acc_gs, vars))
 
-epochs = 1
+epochs = 50
 
 import collections
 import re
@@ -706,7 +706,7 @@ def train_book(sess, book):
         print("".join(predict_buffer), end=' ')
         print("%3.2f%%" % ((progress / len(book)) * 100))
 
-    print("Loss", book_loss)
+    return book_loss
 
 checkpoint_dir = "checkpoints/"
 # Because we only have to save the weights, we could actually vary the constant
@@ -721,13 +721,25 @@ with tf.Session() as sess:
     # seems like this just errors if there are no saved checkpoints
     saver.restore(sess, tf.train.latest_checkpoint(checkpoint_dir))
 
+    lowest_loss_so_far = math.inf
+
     for epoch in range(epochs):
         print("Epoch", epoch, "\n")
 
         sess.run([acc_g.initializer for acc_g in acc_gs])
 
+        epoch_loss = 0
+
         for book in lb.train_books:
-            train_book(sess, book)
+            epoch_loss += train_book(sess, book)
+
+        print("Loss:", epoch_loss, end=' ')
+
+        if epoch_loss < lowest_loss_so_far:
+            lowest_loss_so_far = epoch_loss
+            print("which is the best so far")
+        else:
+            print() # new line
 
         sess.run(apply_grads)
 
