@@ -25,6 +25,9 @@ cmd_arg_def.add_argument("-d", "--debug", help=("Make it easier to catch errors"
 cmd_arg_def.add_argument("-e", "--epochs", metavar='number_of_epochs', type=int,
     default=100, help="Number of training epochs")
 
+cmd_arg_def.add_argument("-l", "--learning_rate", type=float, default=0.01,
+    help="Learning rate factor.")
+
 cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
     type=int, required=True, help="Number of dimensons of the first layer above"
     " the input.")
@@ -651,9 +654,9 @@ target = tf.placeholder(tf.int32, shape=[])
 loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
     labels = target, logits = output)
 
-#optimizer = tf.train.AdadeltaOptimizer(learning_rate=1.0)
+#optimizer = tf.train.AdadeltaOptimizer(learning_rate=cmd_args.learning_rate)
 #optimizer = tf.train.AdamOptimizer()
-optimizer = tf.train.GradientDescentOptimizer(1.0)
+optimizer = tf.train.GradientDescentOptimizer(cmd_args.learning_rate)
 
 grads_and_vars = [(g, v) for g, v in optimizer.compute_gradients(loss) if g is not None]
 
@@ -736,8 +739,10 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
+    to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
     # seems like this just errors if there are no saved checkpoints
-    saver.restore(sess, tf.train.latest_checkpoint(checkpoint_dir))
+    saver.restore(sess, to_load_from)
+    print("Loaded from:", to_load_from)
 
     lowest_loss_so_far = math.inf
 
