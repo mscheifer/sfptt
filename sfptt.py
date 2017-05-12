@@ -105,15 +105,55 @@ def make_conv_op(input, filter_weights, filt_bias):
 
     return tf.tanh(tf.add(filt, filt_bias))
 
-def make_bridge_op(result, num_results_is_odd, bridge_channels, lower_layer_bridge_val):
+import math
+
+# orthogonal initilization from Saxe (2013)
+def orthogonal_init(shape, dtype, partition_info=None):
+    # should think about scaling if using anything other than tanh
+
+    assert len(shape) == 2
+
+    stddev = math.sqrt( 1 / ((shape[0] + shape[1]) / 2))
+
+    random_matrix = tf.random_normal(shape, 0, stddev, dtype)
+    # full matrices being false will cut off the matrices to make it fit our
+    # dimensions
+
+    # for some reason, u loses it's second dimension information so we always
+    # have to use v_t, which means transposing if the smaller dimension ins't
+    # first
+    transpose = random_matrix.shape[1] < random_matrix.shape[0]
+
+    if transpose: random_matrix = tf.transpose(random_matrix)
+
+    # full_matrices means v_t will be (shape[0], shape[1]) assuming shape[0] is
+    # smaller than shape[1]
+    _, _, v_t = tf.svd(random_matrix, full_matrices=False)
+    # u and v_t are unitary and therefore orthogonal because they're not complex
+
+    return v_t if transpose else tf.transpose(v_t)
+
+def conv1d_orthogonal_init(orig_shape, dtype, partition_info=None):
+    #TODO: is this even doing what we want in the convolutional case?
+    # does reshaping just destroy this idea anyway?
+
+    shape = (np.prod(orig_shape[0:-1]), orig_shape[-1])
+
+    mat2d = orthogonal_init(shape, dtype, partition_info)
+
+    return tf.reshape(mat2d, orig_shape)
+
+def make_bridge_op(result, num_results_is_odd, bridge_channels,
+        lower_layer_bridge_val):
+
     def bridge_with_lower_layer():
         return tf.layers.dense(
             # Expand dims to make a fake mini-batch
             inputs = tf.expand_dims(tf.concat([lower_layer_bridge_val,
                 result[-1]], 0), 0),
             units = bridge_channels,
-            activation = tf.tanh
-            # should default to xavier_initializer
+            activation = tf.tanh,
+            kernel_initializer = orthogonal_init
             # should default to 0 initialized bias
             )[0] # extract single value of fake mini batch
 
@@ -126,7 +166,7 @@ def make_bridge_op(result, num_results_is_odd, bridge_channels, lower_layer_brid
             inputs = tf.expand_dims(lower_layer_bridge_val, 0),
             units = bridge_channels,
             activation = None,
-            # should default to xavier_initializer
+            kernel_initializer = orthogonal_init
             # should default to 0 initialized bias
             )[0] # extract single value of fake mini batch
 
@@ -134,8 +174,8 @@ def make_bridge_op(result, num_results_is_odd, bridge_channels, lower_layer_brid
         pass_up_lower_layer)
 
 def make_weights(name, shape):
-    init = tf.contrib.layers.xavier_initializer(dtype=tf.float32)
-    return tf.Variable(init(shape), name=name + "_weights")
+    init = conv1d_orthogonal_init
+    return tf.Variable(init(shape, tf.float32), name=name + "_weights")
 
 def make_simple_layer(lower_layer, num_output_channels):
 
@@ -601,8 +641,6 @@ class Input:
 
 lowest_level_memory_size = 10
 
-import math
-
 max_len = max(len(book) for book in lb.train_books)
 # TODO: can this be dynamic and grow with more input?
 num_layers = int(math.ceil(math.log2(max_len)))
@@ -644,8 +682,8 @@ output = tf.layers.dense(
     inputs = tf.expand_dims(layer.bridge_val, 0),
     units = len(lb.character_set),
     # linear activation function here because we softmax as part of the loss
-    activation = None
-    # should default to xavier_initializer
+    activation = None,
+    kernel_initializer = orthogonal_init
     # should default to 0 initialized bias
     )[0] # extract single value of fake mini batch
 
@@ -740,9 +778,10 @@ with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
     to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
-    # seems like this just errors if there are no saved checkpoints
-    saver.restore(sess, to_load_from)
-    print("Loaded from:", to_load_from)
+
+    if to_load_from is not None:
+        saver.restore(sess, to_load_from)
+        print("Loaded from:", to_load_from)
 
     lowest_loss_so_far = math.inf
 
