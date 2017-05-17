@@ -26,17 +26,20 @@ cmd_arg_def.add_argument("-e", "--epochs", metavar='number_of_epochs', type=int,
     default=100, help="Number of training epochs")
 
 cmd_arg_def.add_argument("-l", "--learning_rate", type=float, default=0.01,
-    help="Learning rate factor.")
+    help="Learning rate factor")
 
 cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
     type=int, required=True, help="Number of dimensons of the first layer above"
-    " the input.")
+    " the input")
 
 cmd_arg_def.add_argument("-f", "--dim_scale", metavar='channel_scale_factor',
     type=float, required=True, help=("The factor of change of dimensons between"
     " layers. Should be between 1 and 2. Anything more than 2 will be trying to"
     " add information that isn't there. Anything less than 1 is probably losing"
     "  almost all of the information."))
+
+cmd_arg_def.add_argument("-s", "--summaries", action="store_true",
+    help="Whether to save weight summaries")
 
 cmd_args = cmd_arg_def.parse_args()
 
@@ -105,76 +108,64 @@ def make_conv_op(input, filter_weights, filt_bias):
 
     return tf.tanh(tf.add(filt, filt_bias))
 
-import math
-
-# orthogonal initilization from Saxe (2013)
-def orthogonal_init(shape, dtype, partition_info=None):
-    # should think about scaling if using anything other than tanh
-
-    assert len(shape) == 2
-
-    stddev = math.sqrt( 1 / ((shape[0] + shape[1]) / 2))
-
-    random_matrix = tf.random_normal(shape, 0, stddev, dtype)
-    # full matrices being false will cut off the matrices to make it fit our
-    # dimensions
-
-    # for some reason, u loses it's second dimension information so we always
-    # have to use v_t, which means transposing if the smaller dimension ins't
-    # first
-    transpose = random_matrix.shape[1] < random_matrix.shape[0]
-
-    if transpose: random_matrix = tf.transpose(random_matrix)
-
-    # full_matrices means v_t will be (shape[0], shape[1]) assuming shape[0] is
-    # smaller than shape[1]
-    _, _, v_t = tf.svd(random_matrix, full_matrices=False)
-    # u and v_t are unitary and therefore orthogonal because they're not complex
-
-    return v_t if transpose else tf.transpose(v_t)
-
-def conv1d_orthogonal_init(orig_shape, dtype, partition_info=None):
-    #TODO: is this even doing what we want in the convolutional case?
-    # does reshaping just destroy this idea anyway?
-
-    shape = (np.prod(orig_shape[0:-1]), orig_shape[-1])
-
-    mat2d = orthogonal_init(shape, dtype, partition_info)
-
-    return tf.reshape(mat2d, orig_shape)
+# TODO: better theoretical justification for scaling by 1.3 for tanh layers?
+# Saxe just says > 1 in the g+ post. Other people are saying because the stddev
+# of tanh(norm(0, 1)) ~ 0.63 then 1.3 will compensate for that.
+#
+# I'm confused by why for orthogonal initilization we can just chop the output
+# side to create our rectangular matrices. Does it really only have to be
+# orthogonal accross the input dimension? What about the backprop signal?
+#
+# Saxe (the originator of orthogonal init from Saxe et. al ICML (2014)) does
+# that in his own code linked below. He also multiplies by the previous layer's
+# initial matrix to work around a different issue and I'm not sure if that
+# affects the orthogonality.
+#
+# https://plus.google.com/+SoumithChintala/posts/RZfdrRQWL6u
+# I can't link directly to a comment on G+ because G+ sucks but you can find it
+# by expanding comments. It's Saxe's first comment.
 
 def make_bridge_op(result, num_results_is_odd, bridge_channels,
         lower_layer_bridge_val):
 
     def bridge_with_lower_layer():
-        return tf.layers.dense(
-            # Expand dims to make a fake mini-batch
-            inputs = tf.expand_dims(tf.concat([lower_layer_bridge_val,
-                result[-1]], 0), 0),
-            units = bridge_channels,
-            activation = tf.tanh,
-            kernel_initializer = orthogonal_init
-            # should default to 0 initialized bias
-            )[0] # extract single value of fake mini batch
+        with tf.name_scope("bridge") as scope:
+            return tf.layers.dense(
+                # Expand dims to make a fake mini-batch
+                inputs = tf.expand_dims(tf.concat([lower_layer_bridge_val,
+                    result[-1]], 0), 0),
+                units = bridge_channels,
+                activation = tf.tanh,
+                # TODO: check if this is the best gain for tanh
+                kernel_initializer = tf.orthogonal_initializer(gain=1.3),
+                # should default to 0 initialized bias
+                # WTF, why does dense() set the scope to the name rather than just
+                # using the current scope?
+                name = scope
+                )[0] # extract single value of fake mini batch
 
     def pass_up_lower_layer():
         if lower_layer_bridge_val.shape == [bridge_channels]:
             return lower_layer_bridge_val
-        # Just do a linear dimensionality change if they don't match
-        return tf.layers.dense(
-            # Expand dims to make a fake mini-batch
-            inputs = tf.expand_dims(lower_layer_bridge_val, 0),
-            units = bridge_channels,
-            activation = None,
-            kernel_initializer = orthogonal_init
-            # should default to 0 initialized bias
-            )[0] # extract single value of fake mini batch
+        with tf.name_scope("bridge") as scope:
+            # Just do a linear dimensionality change if they don't match
+            return tf.layers.dense(
+                # Expand dims to make a fake mini-batch
+                inputs = tf.expand_dims(lower_layer_bridge_val, 0),
+                units = bridge_channels,
+                activation = None,
+                kernel_initializer = tf.orthogonal_initializer(),
+                # should default to 0 initialized bias
+                # WTF, why does dense() set the scope to the name rather than just
+                # using the current scope?
+                name = scope + "_reshape"
+                )[0] # extract single value of fake mini batch
 
     return tf.cond(num_results_is_odd, bridge_with_lower_layer,
         pass_up_lower_layer)
 
 def make_weights(name, shape):
-    init = conv1d_orthogonal_init
+    init = tf.orthogonal_initializer(gain=1.3)
     return tf.Variable(init(shape, tf.float32), name=name + "_weights")
 
 def make_simple_layer(lower_layer, num_output_channels):
@@ -318,12 +309,8 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
     # sliced out of the stitch to feed to the upper layer (so the result is
     # an even number) but are then sent sideways to be used in the bridge.
 
-    def not_neg_one(op):
-        # filter out -1 values of op
-        return tf.logical_not(tf.equal(op, -1))
-
-    result_const_positions = not_neg_one(const_indices)
-    result_conv_positions  = not_neg_one(conv_indices )
+    result_const_positions = tf.not_equal(const_indices, -1)
+    result_conv_positions  = tf.not_equal(conv_indices , -1)
 
     result_const_indices = tf.boolean_mask(const_indices, result_const_positions)
     result_conv_indices  = tf.boolean_mask(conv_indices , result_conv_positions )
@@ -460,8 +447,8 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
                     [max_layer_size.value]), [-1, 2])
 
                 is_const_pair = tf.logical_and(
-                    tf.logical_not(tf.equal(to_find_pairs[:,0], 0)), 
-                    tf.logical_not(tf.equal(to_find_pairs[:,1], 0)))
+                    tf.not_equal(to_find_pairs[:,0], 0),
+                    tf.not_equal(to_find_pairs[:,1], 0))
 
                 found_pairs = tf.boolean_mask(to_find_pairs, is_const_pair)
 
@@ -514,7 +501,7 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
                 return shift_conv_indices, const_index_to_promote, const_to_promote
 
             def valid_promote_index():
-                return [tf.Assert(tf.logical_not(tf.equal(new_const_index, -1)),
+                return [tf.Assert(tf.not_equal(new_const_index, -1),
                     [new_const_index])]
             # shifted_conv is to ensure correct write dependencies on conv_indices
             shifted_conv, promote_index, promote_value = with_assert(lambda:
@@ -639,6 +626,8 @@ class Input:
         self.push_op = tf.cond(write_head < self.max_layer_size,
             simple_add_input, remove_2_values)
 
+import math
+
 lowest_level_memory_size = 10
 
 max_len = max(len(book) for book in lb.train_books)
@@ -683,8 +672,9 @@ output = tf.layers.dense(
     units = len(lb.character_set),
     # linear activation function here because we softmax as part of the loss
     activation = None,
-    kernel_initializer = orthogonal_init
+    kernel_initializer = tf.orthogonal_initializer(),
     # should default to 0 initialized bias
+    name="output_characters"
     )[0] # extract single value of fake mini batch
 
 target = tf.placeholder(tf.int32, shape=[])
@@ -703,29 +693,35 @@ if cmd_args.debug:
 else:
     grads = [g for g, _ in grads_and_vars]
 
-vars = [v for _, v in grads_and_vars]
-
-for v in vars:
-    tf.summary.histogram(v.name + "_hist", v)
-
-import time
-
-write_summaries = tf.summary.FileWriter("./summaries/" + str(time.time()))
+train_vars = [v for _, v in grads_and_vars]
 
 acc_gs = [tf.Variable(tf.fill(g.shape, np.float32(0)), trainable=False,
     name=v.name.translate(str.maketrans("/:", "__")) + "_grad")
     for g, v in grads_and_vars]
 
-for acc_g in acc_gs:
-    tf.summary.histogram(acc_g.name + "_hist", acc_g)
+del grads_and_vars
 
-all_summaries = tf.summary.merge_all()
+if cmd_args.summaries:
+    import time
+
+    summary_dir = "./summaries/" + str(time.time())
+    write_summaries = tf.summary.FileWriter(summary_dir)
+    print("Summary dir:", summary_dir)
+
+    for v in train_vars:
+        tf.summary.histogram(v.name + "_hist", v)
+
+    for acc_g in acc_gs:
+        tf.summary.histogram(acc_g.name + "_hist", acc_g)
+
+    all_summaries = tf.summary.merge_all()
+    assert all_summaries is not None
 
 num_predictions = sum(len(book) - 1 for book in lb.train_books)
 
 # dividing gradients before summing should prevent overflows here
 accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
-apply_grads = optimizer.apply_gradients(zip(acc_gs, vars))
+apply_grads = optimizer.apply_gradients(zip(acc_gs, train_vars))
 
 import collections
 import re
@@ -788,7 +784,7 @@ with tf.Session() as sess:
     epochs = cmd_args.epochs
 
     for epoch in range(epochs):
-        print("Epoch", epoch, "\n")
+        print("\nEpoch", epoch, "\n")
 
         sess.run([acc_g.initializer for acc_g in acc_gs])
 
@@ -811,5 +807,10 @@ with tf.Session() as sess:
         print("Saved to:", save_path)
 
         #epochs - 1 is last one
-#        if epoch % (epochs / 20) == 0 or epoch == epochs - 1:
-#            write_summaries.add_summary(sess.run(all_summaries), epoch)
+        e = epoch
+        if cmd_args.summaries and (e % (epochs / 20) == 0 or e == epochs - 1):
+            print("Summarizing epoch:", e)
+            write_summaries.add_summary(sess.run(all_summaries), epoch)
+
+if cmd_args.summaries:
+    write_summaries.close() # file doesn't auto close when the process exits...
