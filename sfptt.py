@@ -759,7 +759,9 @@ def train_book(sess, book):
 
         print("\033[F\033[F", "".join(book_buffer), sep='')
         print("".join(predict_buffer), end=' ')
-        print("%3.2f%%" % ((progress / len(book)) * 100))
+        # 'progress' starts at 0 so the last value is one less than the total.
+        # The total is -1 because we don't predict the first character. So -2
+        print("%3.2f%%" % ((progress / (len(book) - 2)) * 100))
 
     return book_loss
 
