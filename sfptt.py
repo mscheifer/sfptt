@@ -41,6 +41,8 @@ cmd_arg_def.add_argument("-f", "--dim_scale", metavar='channel_scale_factor',
 cmd_arg_def.add_argument("-s", "--summaries", action="store_true",
     help="Whether to save weight summaries")
 
+cmd_arg_def.add_argument("-o", "--open", help="Chekpoint file to load.")
+
 cmd_args = cmd_arg_def.parse_args()
 
 # Several layers that have some constant indexed values and some indexed values
@@ -775,7 +777,10 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
-    to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
+    if cmd_args.open is None:
+        to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
+    else:
+        to_load_from = cmd_args.open
 
     if to_load_from is not None:
         saver.restore(sess, to_load_from)
