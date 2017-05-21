@@ -735,12 +735,17 @@ def train_book(sess, book):
 
     # TODO: reduce maxlen to terminal width if smaller
     book_buffer = collections.deque(maxlen = 80) 
-    predict_buffer = collections.deque(maxlen = 80)
-
     book_buffer.append(book[0])
-    predict_buffer.append(book[0]) # we don't actually predict the first char
 
-    print("Book length:", len(book), "\n\n")
+    num_top_to_print = 3
+
+    predict_buffers = []
+    for _ in range(num_top_to_print):
+        predict_buffer = collections.deque(maxlen = 80)
+        predict_buffer.append(book[0]) # we don't actually predict the first char
+        predict_buffers.append(predict_buffer)
+
+    print("Book length:", len(book), "\n", "\n" * len(predict_buffers))
 
     for progress, (char, next_char) in enumerate(zip(book[:-1], book[1:])):
         # one hot returns as a 2D batch but we're feeding in 1 at a time
@@ -756,14 +761,25 @@ def train_book(sess, book):
         book_loss += char_loss
 
         book_buffer.append(simplify_whitespace(next_char))
-        predict_buffer.append(
-            simplify_whitespace(lb.index_chars[np.argmax(predict)]))
 
-        print("\033[F\033[F", "".join(book_buffer), sep='')
-        print("".join(predict_buffer), end=' ')
+        # partition softmax probabilities to get indices for top N for N buffers
+        # Negate the predictions so we get the highest values rather than lowest
+        topP = np.argpartition(-predict, len(predict_buffers))[
+            0:len(predict_buffers)]
+        # top N aren't sorted so we need to sort them. This looks weird but we
+        # can index into the top N with the sorted indices of those N and it
+        # will give us indices back into the original vector
+        topP = topP[np.argsort(-predict[topP])]
+
+        for p_char, buffer in zip(topP, predict_buffers):
+            buffer.append(simplify_whitespace(lb.index_chars[p_char]))
+
+        print("\033[F", "\033[F" * len(predict_buffers), "".join(book_buffer), sep='', end=' ')
+        print("%3.2f%%" % ((progress / (len(book) - 2)) * 100))
+        for predict_buffer in predict_buffers:
+            print("".join(predict_buffer))
         # 'progress' starts at 0 so the last value is one less than the total.
         # The total is -1 because we don't predict the first character. So -2
-        print("%3.2f%%" % ((progress / (len(book) - 2)) * 100))
 
     return book_loss
 
