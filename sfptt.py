@@ -684,9 +684,7 @@ target = tf.placeholder(tf.int32, shape=[])
 loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
     labels = target, logits = output)
 
-#optimizer = tf.train.AdadeltaOptimizer(learning_rate=cmd_args.learning_rate)
-#optimizer = tf.train.AdamOptimizer()
-optimizer = tf.train.GradientDescentOptimizer(cmd_args.learning_rate)
+optimizer = tf.train.AdamOptimizer(learning_rate=cmd_args.learning_rate)
 
 grads_and_vars = [(g, v) for g, v in optimizer.compute_gradients(loss) if g is not None]
 
@@ -784,9 +782,18 @@ def train_book(sess, book):
     return book_loss
 
 checkpoint_dir = "checkpoints/"
+
+vars_to_save = list(tf.trainable_variables()) # copy the list
+
+for var in train_vars:
+    for slot_name in optimizer.get_slot_names():
+        slot_var = optimizer.get_slot(var, slot_name)
+        assert slot_var is not None
+        vars_to_save.append(slot_var)
+
 # Because we only have to save the weights, we could actually vary the constant
 # sizes between training sessions
-saver = tf.train.Saver(tf.trainable_variables())
+saver = tf.train.Saver(vars_to_save)
 import os
 os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -816,7 +823,9 @@ with tf.Session() as sess:
         for book in lb.train_books:
             epoch_loss += train_book(sess, book)
 
-        print("Loss:", epoch_loss, end=' ')
+        total_characters = sum(len(book) for book in lb.train_books)
+
+        print("Loss per character:", epoch_loss / total_characters, end=' ')
 
         if epoch_loss < lowest_loss_so_far:
             lowest_loss_so_far = epoch_loss
