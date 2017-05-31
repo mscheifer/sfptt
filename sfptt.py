@@ -25,7 +25,7 @@ cmd_arg_def.add_argument("-d", "--debug", help=("Make it easier to catch errors"
 cmd_arg_def.add_argument("-e", "--epochs", metavar='number_of_epochs', type=int,
     default=100, help="Number of training epochs")
 
-cmd_arg_def.add_argument("-l", "--learning_rate", type=float, default=0.01,
+cmd_arg_def.add_argument("-l", "--learning_rate", type=float, default=0.001,
     help="Learning rate factor")
 
 cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
