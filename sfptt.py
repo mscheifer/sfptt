@@ -701,8 +701,9 @@ acc_gs = [tf.Variable(tf.fill(g.shape, np.float32(0)), trainable=False,
 
 del grads_and_vars
 
+import time
+
 if cmd_args.summaries:
-    import time
 
     summary_dir = "./summaries/" + str(time.time())
     write_summaries = tf.summary.FileWriter(summary_dir)
@@ -816,6 +817,8 @@ with tf.Session() as sess:
     for epoch in range(epochs):
         print("\nEpoch", epoch, "\n")
 
+        start_time = time.time()
+
         sess.run([acc_g.initializer for acc_g in acc_gs])
 
         epoch_loss = 0
@@ -843,6 +846,8 @@ with tf.Session() as sess:
         if cmd_args.summaries and (e % (epochs / 20) == 0 or e == epochs - 1):
             print("Summarizing epoch:", e)
             write_summaries.add_summary(sess.run(all_summaries), epoch)
+
+        print("Epoch took:", time.time() - start_time, "seconds")
 
 if cmd_args.summaries:
     write_summaries.close() # file doesn't auto close when the process exits...
