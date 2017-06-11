@@ -103,10 +103,11 @@ def is_odd(op):
     return tf.equal(op % 2, 1)
 
 def make_conv_op(input, filter_weights, filt_bias):
-    # Need to add a fake batch dimension because all the conv functions
-    # assume you are using batches. Likewise we need to extract our "batch"
-    filt = extract_singleton(tf.nn.conv1d(tf.expand_dims(input, 0),
-         filter_weights, 2, 'SAME'))
+
+    assert len(input.shape) == 2
+    assert len(filter_weights.shape) == 3
+    filt = tf.matmul(tf.reshape(input, [-1, 2 * input.shape[1].value]),
+            tf.reshape(filter_weights, [-1, filter_weights.shape[-1].value]))
 
     return tf.tanh(tf.add(filt, filt_bias))
 
@@ -182,9 +183,7 @@ def make_simple_layer(lower_layer, num_output_channels):
     filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
         dtype=tf.float32), name="filter_baises")
 
-    #ugh dumb hack around nasty bug
-    lower_layer_result = tf.concat([np.zeros([2, num_input_channels]), lower_layer.result_op], 0)
-    conv = make_conv_op(lower_layer_result, filter_weights, filt_bias)[1:] # slice off hack
+    conv = make_conv_op(lower_layer.result_op, filter_weights, filt_bias)
 
     num_results_is_odd = is_odd(tf.shape(conv)[0])
 
@@ -219,7 +218,7 @@ def make_simple_layer(lower_layer, num_output_channels):
             lower_push = lower_layer.push_op
 
             def assert_no_promote():
-                return [tf.Assert(lower_push[0] < 0, [lower_push])]
+                return [tf.Assert(lower_push[0] < 0, lower_push)]
 
             self.push_op = with_assert(lambda: lower_push, assert_no_promote)
 
@@ -255,9 +254,7 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
     # However, we don't need to ever promote if the max conv values + the
     # number of constants is less than 'max_outputs_for_dataset'
     extra_constants_for_dataset = max(
-        # Make sure this isn't less than 1 because we currently have that hack
-        # where we start with a 0 in the constants.
-        tf.Dimension(max_outputs_for_dataset) - max_conv_values, 1)
+        tf.Dimension(max_outputs_for_dataset) - max_conv_values, 0)
     # The conv shape size may be odd. If so we should use another odd number
     # for the constant size, that way the sum of the two will be even.
     if max_conv_values % 2 != extra_constants_for_dataset % 2:
@@ -272,28 +269,20 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
 
     # Ugh, really stupid bug with fill here. Can't mix dimenions and
     # integers so we need to get the value of the dimension.
-    # Setting constants to 0 instead of nan because we need at least the
-    # first value to be 0 to fix the stupid junk gradient bug
     constants = tf.Variable(tf.fill([num_constants.value, num_output_channels],
-        np.float32(0)), trainable=False, name="consts")
+        np.nan), trainable=False, name="consts")
 
     # Ugh, really stupid bug with fill here. Can't mix dimenions and
     # integers so we need to get the value of the dimension.
-    const_ind_init = tf.fill([num_constants.value - 1], np.int32(-1))
-    # Starting with a const value (so plus the lower value, the two values
-    # will go up a layer to be convolved) prevents a nasty bug when
-    # convolutions have 0 outputs (and maybe evaluated conditionally or
-    # something) and going through a dynamic stitch. I dunno but it seemed
-    # to be reading junk data into the gradient. 
-    const_ind_init = tf.concat([tf.zeros([1], tf.int32), const_ind_init], 0)
-    const_indices = tf.Variable(const_ind_init,
-        trainable=False, name="const_indices")
+    const_ind_init = tf.fill([num_constants.value], np.int32(-1))
+
+    const_indices = tf.Variable(const_ind_init, trainable=False,
+        name="const_indices")
     del const_ind_init
-    # Starting with the lower layer always having a 0 come up to prevent
-    # the nasty bug described above so that goes in the 1st index
+
     # Ugh, really stupid bug with fill here. Can't give dimension arguments
-    conv_ind_init = tf.fill([max_conv_values.value - 1], np.int32(-1))
-    conv_ind_init = tf.concat([tf.ones([1], tf.int32), conv_ind_init], 0)
+    conv_ind_init = tf.fill([max_conv_values.value], np.int32(-1))
+
     conv_indices = tf.Variable(conv_ind_init, trainable=False,
         name="conv_indices")
     del conv_ind_init
@@ -547,20 +536,11 @@ def make_layer(lower_layer, num_output_channels, max_outputs_for_dataset):
 
 class Input:
     def __init__(self, num_constants):
-        # Starting the write head at 2 and starting with an initial 00 value (so
-        # the first input will be bridges and we start with two zeros convolved
-        # above) prevents a nasty bug when convolutions have 0 outputs (and
-        # maybe evaluated conditionally or something) and going through a
-        # dynamic stitch. I dunno but it seemed to be reading junk data into
-        # the gradient. 
-        write_head = tf.Variable(np.int32(2), trainable=False)
+        write_head = tf.Variable(np.int32(0), trainable=False)
 
         input_channels = len(lb.character_set)
 
-        c_init = tf.fill([num_constants-2, input_channels], np.float32(np.nan))
-        # Here is the 0 value to fix nasty bug described above
-        c_init = tf.concat([tf.fill([2, input_channels], np.float32(0)),
-             c_init], axis=0)
+        c_init = tf.fill([num_constants, input_channels], np.float32(np.nan))
         constants = tf.Variable(c_init, trainable=False)
 
         self.reset = tf.group(write_head.initializer, constants.initializer)
