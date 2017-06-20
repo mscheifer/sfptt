@@ -43,21 +43,6 @@ cmd_arg_def.add_argument("-s", "--summaries", action="store_true",
 
 cmd_args = cmd_arg_def.parse_args()
 
-def with_assert(op_factory, assert_factory):
-    if cmd_args.debug:
-        with tf.control_dependencies(assert_factory()):
-            return op_factory()
-    return op_factory()
-
-def extract_singleton(op):
-    def assert_one_element():
-        fst_dim = tf.shape(op)[0]
-        return [tf.Assert(tf.equal(fst_dim, 1), [fst_dim])]
-    return with_assert(lambda: op[0], assert_one_element)
-
-def is_odd(op):
-    return tf.equal(op % 2, 1)
-
 # TODO: so what this should be is: Every layer produces len(target) values. The
 # upper layer takes those values and half of them are linearly translated up
 # and the other half are linearly combined with the odd value at that layer and
@@ -90,6 +75,8 @@ def make_conv_op(input, filter_weights, filt_bias):
 
     assert len(input.shape) == 2
     assert len(filter_weights.shape) == 3
+    assert input.shape[0] % 2 == 0
+
     filt = tf.matmul(tf.reshape(input, [-1, 2 * input.shape[1].value]),
             tf.reshape(filter_weights, [-1, filter_weights.shape[-1].value]))
 
@@ -101,12 +88,12 @@ def make_weights(name, shape):
 
 def make_bridge(conv, bridge_weights):
 
-    ret = conv[::2] # every other value, keep the last value if odd
+    ret = conv[::2] # odd values, keep the last value if total is odd
     ret = tf.matmul(ret, bridge_weights)
-    if conv.shape[0] % 2 == 1: # Check the original, not 'ret' b/c even/2 is odd
+    if conv.shape[0] % 2 == 1:# Check the original, size of 'ret' is always odd
         last_odd_val = ret[-1:]
         ret = ret[:-1] # don't pad from the last odd value
-    ret = tf.pad(tf.expand_dims(ret, 0), [[0,1], [0,0], [0,0]])
+    ret = tf.pad(tf.expand_dims(ret, 1), [[0,0], [0,1], [0,0]])
     # Pad with 1 zero at each value then reshape again so it's like we just put
     # 0s over all of the even values, but then have a broadcast dimension over
     # the chunk size
@@ -116,7 +103,7 @@ def make_bridge(conv, bridge_weights):
     assert ret.shape[0] == conv.shape[0], str(ret.shape) + str(conv.shape)
     return ret
 
-def make_simple_layer(lower_layer, num_output_channels, chunk_size):
+def make_layer(lower_layer, num_output_channels, chunk_size):
 
     # First dimension is what we conv over, 2nd is number of channels
     # Btw, .value fixes a really stupid bug with xavier_init because it
@@ -130,21 +117,13 @@ def make_simple_layer(lower_layer, num_output_channels, chunk_size):
 
     conv = make_conv_op(lower_layer.result_op, filter_weights, filt_bias)
 
+    assert conv.shape[0] != 0, "This layer isn't adding anything."
+
     num_results_is_odd = conv.shape[0] % 2 == 1
 
     # If we have an odd number of results, don't push the last one up. It
     # will be bridged.
     result_op = conv[0:-1] if num_results_is_odd else conv
-
-    assert lower_layer.max_layer_size % 2 == 0
-    max_layer_size = (lower_layer.max_layer_size // 2)
-    # max layer size is when there is no bridge. We can actually set the max
-    # size to be more than it will ever be in order to fulfill that definition
-    # because layers are always allowed to have fewer results than their max.
-    if max_layer_size % 2 == 1:
-        max_layer_size += 1
-
-    assert max_layer_size % 2 == 0, str((lower_layer.max_layer_size, max_layer_size))
 
     bridge_pieces = [lower_layer.bridge[:chunk_size - 1]]
 
@@ -160,7 +139,6 @@ def make_simple_layer(lower_layer, num_output_channels, chunk_size):
         chunked_lower = tf.reshape(bridge_no_early_values[:full_chunks * chunk_size],
             [full_chunks, chunk_size, len(lb.character_set)])
 
-        print(conv.shape[0], lower_layer.bridge.shape[0], full_chunks * chunk_size, bridge_no_early_values.shape)
         if full_chunks * chunk_size < bridge_no_early_values.shape[0]:
             bridge_conv = conv[0:-1]
         else: # For the corner case where there are exactly chunk_size - 1
@@ -182,41 +160,34 @@ def make_simple_layer(lower_layer, num_output_channels, chunk_size):
 
     class Layer:
         def __init__(self):
-            self.max_layer_size = max_layer_size
             self.result_op = result_op
-            print([str(piece.shape) for piece in bridge_pieces])
             self.bridge = tf.concat(bridge_pieces, 0)
-            assert self.bridge.shape == lower_layer.bridge.shape, str(self.bridge.shape) + str(lower_layer.bridge.shape)
+            assert self.bridge.shape == lower_layer.bridge.shape, str(
+                self.bridge.shape) + str(lower_layer.bridge.shape)
 
     return Layer()
-
-def make_layer(lower_layer, num_output_channels, chunk_size, max_outputs_for_dataset):
-
-    assert lower_layer.max_layer_size % 2 == 0
-    max_conv_values = lower_layer.max_layer_size // 2
-
-    # if the convolution values and the bridge are enough to cover the entire
-    # input length then we can create a layer that doesn't need constants
-    assert max_conv_values >= max_outputs_for_dataset
-
-    return make_simple_layer(lower_layer, num_output_channels, chunk_size)
 
 import math
 
 lowest_level_memory_size = 10
 
 max_len = max(len(book) for book in lb.train_books)
-# TODO: can this be dynamic and grow with more input?
-num_layers = int(math.ceil(math.log2(max_len)))
-print("Max book length", max_len, "so number of layers is", num_layers)
 
 class Input:
     def __init__(self):
+        self.input_seq = tf.placeholder(shape=[max_len - 1,
+            len(lb.character_set)], dtype=tf.float32, name="input_layer")
+
         bridge_weight = make_weights("bridge",
-             [len(lb.character_set), len(lb.character_set)])
-        self.result_op = tf.placeholder(shape=[max_len, len(lb.character_set)],
-            dtype=tf.float32, name="input_layer")
-        self.bridge = tf.reshape(make_bridge(self.result_op, bridge_weight), [-1, len(lb.character_set)])
+            [len(lb.character_set), len(lb.character_set)])
+
+        if self.input_seq.shape[0] % 2 == 0:
+            self.result_op = self.input_seq 
+        else:
+            self.result_op = self.input_seq[:-1]
+
+        self.bridge = tf.reshape(make_bridge(self.input_seq, bridge_weight),
+            [-1, len(lb.character_set)])
         self.max_layer_size = self.result_op.shape[0]
 
 with tf.name_scope("input"):
@@ -227,28 +198,28 @@ layer_channels = cmd_args.base_dims
 
 memory_scale_factor = cmd_args.dim_scale
 
+# Floor because we want a power of 2 less than max_len. If we took a power of 2
+# greater than max_len then we would never use that value (because we would
+# never have enough input).
+num_layers = int(math.floor(math.log2(max_len)))
+print("Max book length", max_len, "so number of layers is", num_layers)
+
 for i in range(num_layers):
     # Chunk size should be the number of input characters represented by each
     # output vector of the layer we are about to create
     chunk_size = 2 ** (i + 1)
-    # max_chunks is how many we need to represent every character in the
-    # largest example in our dataset, rounded up.
-    max_chunks = max_len // chunk_size + (0 if max_len % chunk_size == 0 else 1)
 
     with tf.name_scope("layer_" + str(i)):
-        layer = make_layer(layer, layer_channels, chunk_size, max_chunks)
+        layer = make_layer(layer, layer_channels, chunk_size)
         print("Layer", i, "has", layer_channels, "channels and",
-            layer.max_layer_size, "values.")
+            layer.result_op.shape[0], "values to pass up to the next layer.")
 
     layer_channels = int(math.ceil(layer_channels * memory_scale_factor))
-
-print("The final layer says size 2 but only 1 value will ever be computed.",
-    "It just says 2 because every layer has to have a positive even max size")
 
 output = layer.bridge + tf.Variable(tf.zeros([1, len(lb.character_set)],
     dtype=tf.float32), name="output_baises")
 
-target = tf.placeholder(tf.int32, shape=[max_len])
+target = tf.placeholder(tf.int32, shape=[max_len - 1])
 
 loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
     labels = target, logits = output)
@@ -287,52 +258,38 @@ if cmd_args.summaries:
     all_summaries = tf.summary.merge_all()
     assert all_summaries is not None
 
-num_predictions = sum(len(book) - 1 for book in lb.train_books)
-
-# dividing gradients before summing should prevent overflows here
-accumulate_gradients = [ag.assign_add(g / num_predictions) for ag, g in zip(acc_gs, grads)]
+accumulate_gradients = [ag.assign_add(g / len(lb.train_books)) 
+    for ag, g in zip(acc_gs, grads)]
 apply_grads = optimizer.apply_gradients(zip(acc_gs, train_vars))
 
-import collections
+book_loss_op = tf.reduce_sum(loss)
+
+import shutil
+
+print_width=shutil.get_terminal_size().columns
+
 import re
 
 def train_book(sess, book):
 
-    num_top_to_print = 3
+    print("Book length:", len(book))
 
-    predict_buffers = []
-    for _ in range(num_top_to_print):
-        predict_buffer = collections.deque(maxlen = 80)
-        predict_buffer.append(book[0]) # we don't actually predict the first char
-        predict_buffers.append(predict_buffer)
-
-#    print("Book length:", len(book), "\n", "\n" * len(predict_buffers))
+    book = book + (' ' * (max_len - len(book))) # padding
 
     inj = { target : [lb.char_indices[next_char] for next_char in book[1:]],
-        input_layer.result_op : lb.one_hot(book[:-1]) }
+        input_layer.input_seq : lb.one_hot(book[:-1]) }
 
     book_loss, predict, _ = sess.run(
-        [loss, output, accumulate_gradients], inj)
+        [book_loss_op, output, accumulate_gradients], inj)
+
+    predict_book = "".join(lb.index_chars[np.argmax(p)] for p in predict[-print_width:])
 
     def simplify_whitespace(s):
         return re.sub(r"\s", " ", s)
 
-    # partition softmax probabilities to get indices for top N for N buffers
-    # Negate the predictions so we get the highest values rather than lowest
-#    topP = np.argpartition(-predict, len(predict_buffers))[
-#        0:len(predict_buffers)]
-    # top N aren't sorted so we need to sort them. This looks weird but we
-    # can index into the top N with the sorted indices of those N and it
-    # will give us indices back into the original vector
-#    topP = topP[np.argsort(-predict[topP])]
-
-#    for p_char, buffer in zip(topP, predict_buffers):
-#        buffer.append(simplify_whitespace(lb.index_chars[p_char]))
-
-#    print("\033[F", "\033[F" * len(predict_buffers),
-#        simplify_whitespace(book[-80:]), sep='', end=' ')
-#    for predict_buffer in predict_buffers:
-#        print("".join(predict_buffer))
+    print(simplify_whitespace(book[-print_width:]))
+    print(simplify_whitespace(book[0] + predict_book 
+        if len(predict_book) < print_width else predict_book))
 
     return book_loss
 
