@@ -71,20 +71,11 @@ cmd_args = cmd_arg_def.parse_args()
 # output_size]. Then the reshape and return up. There will be remainder values
 # from the division and we have to make sure those get the correct value too.
 
-def make_conv_op(input, filter_weights, filt_bias):
-
-    assert len(input.shape) == 2
-    assert len(filter_weights.shape) == 3
-    assert input.shape[0] % 2 == 0
-
-    filt = tf.matmul(tf.reshape(input, [-1, 2 * input.shape[1].value]),
-            tf.reshape(filter_weights, [-1, filter_weights.shape[-1].value]))
-
-    return tf.tanh(tf.add(filt, filt_bias))
-
 def make_weights(name, shape):
     init = tf.orthogonal_initializer(gain=1.3)
     return tf.Variable(init(shape, tf.float32), name=name + "_weights")
+
+bridge_out_size = 100
 
 def make_bridge(conv, bridge_weights):
 
@@ -97,7 +88,7 @@ def make_bridge(conv, bridge_weights):
     # Pad with 1 zero at each value then reshape again so it's like we just put
     # 0s over all of the even values, but then have a broadcast dimension over
     # the chunk size
-    ret = tf.reshape(ret, [-1, 1, len(lb.character_set)])
+    ret = tf.reshape(ret, [-1, 1, bridge_out_size])
     if conv.shape[0] % 2 == 1:
         ret = tf.concat([ret, tf.expand_dims(last_odd_val, 0)], 0)
     assert ret.shape[0] == conv.shape[0], str(ret.shape) + str(conv.shape)
@@ -105,17 +96,23 @@ def make_bridge(conv, bridge_weights):
 
 def make_layer(lower_layer, num_output_channels, chunk_size):
 
+    assert len(lower_layer.result_op.shape) == 2
     # First dimension is what we conv over, 2nd is number of channels
     # Btw, .value fixes a really stupid bug with xavier_init because it
     # doesn't auto convert the dimension to an integer
-    num_input_channels = lower_layer.result_op.get_shape()[1].value
+    num_input_channels = lower_layer.result_op.shape[1].value
 
     filter_weights = make_weights("filter",
-        [2, num_input_channels, num_output_channels])
+        [2 * num_input_channels, num_output_channels])
     filt_bias = tf.Variable(tf.zeros([1, num_output_channels],
         dtype=tf.float32), name="filter_baises")
 
-    conv = make_conv_op(lower_layer.result_op, filter_weights, filt_bias)
+    assert lower_layer.result_op.shape[0] % 2 == 0
+
+    filt = tf.matmul(tf.reshape(lower_layer.result_op, [-1,
+        2 * num_input_channels]), filter_weights)
+
+    conv = tf.tanh(tf.add(filt, filt_bias))
 
     assert conv.shape[0] != 0, "This layer isn't adding anything."
 
@@ -132,12 +129,12 @@ def make_layer(lower_layer, num_output_channels, chunk_size):
     full_chunks = bridge_no_early_values.shape[0].value // chunk_size
 
     bridge_weight = make_weights("bridge",
-        [num_output_channels, len(lb.character_set)])
+        [num_output_channels, bridge_out_size])
 
     if full_chunks > 0:
 
         chunked_lower = tf.reshape(bridge_no_early_values[:full_chunks * chunk_size],
-            [full_chunks, chunk_size, len(lb.character_set)])
+            [full_chunks, chunk_size, bridge_out_size])
 
         if full_chunks * chunk_size < bridge_no_early_values.shape[0]:
             bridge_conv = conv[0:-1]
@@ -147,7 +144,7 @@ def make_layer(lower_layer, num_output_channels, chunk_size):
             bridge_conv = conv
 
         w_br = chunked_lower + make_bridge(bridge_conv, bridge_weight)
-        bridge_pieces.append(tf.reshape(w_br, [-1, len(lb.character_set)]))
+        bridge_pieces.append(tf.reshape(w_br, [-1, bridge_out_size]))
 
     if full_chunks * chunk_size < bridge_no_early_values.shape[0]:
         # slice off the remainder
@@ -179,7 +176,7 @@ class Input:
             len(lb.character_set)], dtype=tf.float32, name="input_layer")
 
         bridge_weight = make_weights("bridge",
-            [len(lb.character_set), len(lb.character_set)])
+            [len(lb.character_set), bridge_out_size])
 
         if self.input_seq.shape[0] % 2 == 0:
             self.result_op = self.input_seq 
@@ -187,7 +184,7 @@ class Input:
             self.result_op = self.input_seq[:-1]
 
         self.bridge = tf.reshape(make_bridge(self.input_seq, bridge_weight),
-            [-1, len(lb.character_set)])
+            [-1, bridge_out_size])
         self.max_layer_size = self.result_op.shape[0]
 
 with tf.name_scope("input"):
@@ -216,8 +213,20 @@ for i in range(num_layers):
 
     layer_channels = int(math.ceil(layer_channels * memory_scale_factor))
 
-output = layer.bridge + tf.Variable(tf.zeros([1, len(lb.character_set)],
-    dtype=tf.float32), name="output_baises")
+first_bridge_bias = tf.Variable(tf.zeros([1, bridge_out_size],
+    dtype=tf.float32), name="first_bridge_baises")
+
+first_bridge = tf.tanh(layer.bridge + first_bridge_bias)
+
+output = tf.layers.dense(
+    # Expand dims to make a fake mini-batch
+    inputs = first_bridge,
+    units = len(lb.character_set),
+    # linear activation function here because we softmax as part of the loss
+    activation = None,
+    kernel_initializer = tf.orthogonal_initializer(),
+    # should default to 0 initialized bias
+    name="output_characters")
 
 target = tf.placeholder(tf.int32, shape=[max_len - 1])
 
