@@ -218,9 +218,22 @@ first_bridge_bias = tf.Variable(tf.zeros([1, bridge_out_size],
 
 first_bridge = tf.tanh(layer.bridge + first_bridge_bias)
 
+layer_sizes = [75, 50]
+
+output = first_bridge
+for size in layer_sizes:
+    output = tf.layers.dense(
+        # Expand dims to make a fake mini-batch
+        inputs = output,
+        units = size,
+        activation = tf.tanh,
+        kernel_initializer = tf.orthogonal_initializer(),
+        # should default to 0 initialized bias
+        name="output_" + str(size))
+
 output = tf.layers.dense(
     # Expand dims to make a fake mini-batch
-    inputs = first_bridge,
+    inputs = output,
     units = len(lb.character_set),
     # linear activation function here because we softmax as part of the loss
     activation = None,
