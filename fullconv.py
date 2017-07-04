@@ -312,7 +312,7 @@ def train_book(sess, orig_book):
     print("Book length:", len(orig_book))
     # Adding some newlines at the start should help it be more translationally
     # invariant
-    book = "\n" * random.randint(0, 5) + orig_book
+    book = ("\n" * random.randint(0, 5)) + orig_book
 
     #TODO: need to adjust so predicts based on these extra newlines don't get
     # printed
@@ -351,19 +351,12 @@ def train_book(sess, orig_book):
 
 checkpoint_dir = "checkpoints/"
 
-vars_to_save = list(tf.trainable_variables()) # copy the list
-
-for var in train_vars:
-    for slot_name in optimizer.get_slot_names():
-        slot_var = optimizer.get_slot(var, slot_name)
-        assert slot_var is not None
-        vars_to_save.append(slot_var)
-
-# Because we only have to save the weights, we could actually vary the constant
-# sizes between training sessions
-saver = tf.train.Saver(vars_to_save)
+print("Initializing checkpoint saver...", end=' ')
+saver = tf.train.Saver() # Buy default saves all variables, including stuff
+# beta power accumulators in the Optimizer
 import os
 os.makedirs(checkpoint_dir, exist_ok=True)
+print("done.")
 
 #TODO: ok so deliberately stop propagating gradients through some paths to see
 # if initialization is still helping. So like don't propagate through the
@@ -373,7 +366,8 @@ os.makedirs(checkpoint_dir, exist_ok=True)
 book_minibatch_size = 5
 
 with tf.Session() as sess:
-    sess.run(tf.global_variables_initializer())
+
+    print("Session start")
 
     if cmd_args.open is None:
         to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
@@ -381,8 +375,12 @@ with tf.Session() as sess:
         to_load_from = cmd_args.open
 
     if to_load_from is not None:
+        print("Loading from:", to_load_from, "...", end=' ')
         saver.restore(sess, to_load_from)
-        print("Loaded from:", to_load_from)
+    else:
+        print("No checkpoints, initializing for the first time...", end=' ')
+        sess.run(tf.global_variables_initializer())
+    print("done.")
 
     if cmd_args.forward is not None:
         text = cmd_args.forward
