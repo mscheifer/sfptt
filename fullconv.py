@@ -243,7 +243,7 @@ output = tf.layers.dense(
     # should default to 0 initialized bias
     name="output_characters")
 
-next_char = tf.arg_max(output[-1], 0)
+next_char = tf.nn.softmax(output[-1])
 
 target = tf.placeholder(tf.int32, shape=[None])
 
@@ -312,10 +312,8 @@ def train_book(sess, orig_book):
     print("Book length:", len(orig_book))
     # Adding some newlines at the start should help it be more translationally
     # invariant
-    book = ("\n" * random.randint(0, 5)) + orig_book
-
-    #TODO: need to adjust so predicts based on these extra newlines don't get
-    # printed
+    perturb_len = random.randint(0, 5)
+    book = ("\n" * perturb_len) + orig_book
 
     inj = { target : [lb.char_indices[next_char] for next_char in book[1:]],
         input_layer.input_seq : lb.one_hot(book[:-1]) }
@@ -329,7 +327,8 @@ def train_book(sess, orig_book):
 
         predict_book = book[0] + "".join(lb.index_chars[np.argmax(p)]
             for p in np.concatenate([
-            predict[:front_len - 1], predict[-print_width // 2:]]))
+                predict[perturb_len:perturb_len + front_len - 1],
+                predict[-print_width // 2:]]))
 
         assert len(predict_book) == print_width, len(predict_book)
 
@@ -338,7 +337,7 @@ def train_book(sess, orig_book):
             "Make sure '+' is concatenate lists, not broadcast add")
     else:
         predict_book = book[0] + "".join(lb.index_chars[np.argmax(p)]
-            for p in predict)
+            for p in predict[perturb_len:])
         orig_to_print = orig_book
 
     def simplify_whitespace(s):
@@ -365,9 +364,33 @@ print("done.")
 
 book_minibatch_size = 5
 
+import objgraph
+import pympler.asizeof
+
+def runforward(sess):
+    n_char_probs = sess.run(next_char,
+        { input_layer.input_seq : lb.one_hot(text) })
+    if len(n_char_probs) == 1:
+        return lb.index_chars[0]
+    # The model isn't going to give us an exact probabilty distribution
+    # because of rounding errors. Numpy's multinomial has an assertion
+    # that the probabilities (except the last) don't exceed one. So
+    # let's just fudge the second to last character (whatever it is) by
+    # the difference to fix this problem.
+    fudge = max(sum(n_char_probs[:-1]) - 1, 0)
+    n_char_probs[-2] -= fudge
+    samples = np.random.multinomial(1, n_char_probs)
+    n_char = np.argmax(samples)
+    assert samples[n_char] == 1
+    assert np.all(np.equal(samples[:n_char], 0))
+    assert np.all(np.equal(samples[n_char+1:], 0))
+    return lb.index_chars[n_char]
+
 with tf.Session() as sess:
 
     print("Session start")
+
+#    print(pympler.asizeof.asized(objgraph.by_type('Tensor'), detail=1).format())
 
     if cmd_args.open is None:
         to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
@@ -386,12 +409,9 @@ with tf.Session() as sess:
         text = cmd_args.forward
         print(text, end='')
         while True:
-            n_char = sess.run(next_char, {
-                input_layer.input_seq : lb.one_hot(text),
-                actual_book_length    : len(text) + 1 })
-            n_char = lb.index_chars[n_char]
-            text += n_char
+            n_char = runforward(sess)
             print(n_char, end='', flush=True)
+            text += n_char
 
     lowest_loss_so_far = math.inf
 
