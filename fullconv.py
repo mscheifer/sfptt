@@ -350,7 +350,7 @@ def train_book(sess, orig_book):
 
 checkpoint_dir = "checkpoints/"
 
-print("Initializing checkpoint saver...", end=' ')
+print("Initializing checkpoint saver...", end=' ', flush=True)
 saver = tf.train.Saver() # Buy default saves all variables, including stuff
 # beta power accumulators in the Optimizer
 import os
@@ -398,10 +398,11 @@ with tf.Session() as sess:
         to_load_from = cmd_args.open
 
     if to_load_from is not None:
-        print("Loading from:", to_load_from, "...", end=' ')
+        print("Loading from:", to_load_from, "...", end=' ', flush=True)
         saver.restore(sess, to_load_from)
     else:
-        print("No checkpoints, initializing for the first time...", end=' ')
+        print("No checkpoints, initializing for the first time...", end=' ',
+            flush=True)
         sess.run(tf.global_variables_initializer())
     print("done.")
 
