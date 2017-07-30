@@ -81,10 +81,13 @@ def make_weights(name, shape):
 
 bridge_out_size = 150
 
-def make_bridge(conv, bridge_weights):
+def make_bridge(conv, bridge_weights, conv_is_logits=False):
 
     ret = conv[::2] # odd values, keep the last value if total is odd
-    ret = tf.matmul(ret, bridge_weights)
+    if conv_is_logits:
+        ret = tf.gather(bridge_weights, ret)
+    else:
+        ret = tf.matmul(ret, bridge_weights)
 
     last_odd_val = ret[-1:]
     conv_is_odd = tf.equal(tf.shape(conv)[0] % 2, 1)
@@ -170,14 +173,19 @@ max_len = max(len(book) for book in lb.train_books) + max_initial_newlines
 
 class Input:
     def __init__(self, bridge_weight):
-        self.input_seq = tf.placeholder(shape=[None,
-            len(lb.character_set)], dtype=tf.float32, name="input_layer")
+        self.input_seq = tf.placeholder(shape=[None], dtype=tf.int32,
+            name="input_logits")
 
-        self.result_op = tf.cond(tf.equal(tf.shape(self.input_seq)[0] % 2, 1),
+        even_result = tf.cond(tf.equal(tf.shape(self.input_seq)[0] % 2, 1),
             lambda: self.input_seq[0:-1], lambda: self.input_seq)
 
-        self.bridge = tf.reshape(make_bridge(self.input_seq, bridge_weight),
-            [-1, bridge_out_size])
+        self.result_op = tf.one_hot(even_result, len(lb.character_set))
+
+        # rather than multiplying the input as one hot vectors, we will
+        # just to tf.gather on the input logits.
+
+        self.bridge = tf.reshape(make_bridge(self.input_seq, bridge_weight,
+            True), [-1, bridge_out_size])
 
 import math
 
@@ -316,7 +324,7 @@ def train_book(sess, orig_book):
     book = ("\n" * perturb_len) + orig_book
 
     inj = { target : [lb.char_indices[next_char] for next_char in book[1:]],
-        input_layer.input_seq : lb.one_hot(book[:-1]) }
+        input_layer.input_seq : lb.logits(book[:-1], np.int32) }
 
     book_loss, predict, _ = sess.run(
         [book_loss_op, output, accumulate_gradients], inj)
@@ -362,23 +370,27 @@ print("done.")
 # bridge except the top layer and then see what magnitude of gradient we get at
 # the bottom layer.
 
-book_minibatch_size = 5
+book_minibatch_size = 10
 
 import objgraph
 import pympler.asizeof
 
 def runforward(sess):
     n_char_probs = sess.run(next_char,
-        { input_layer.input_seq : lb.one_hot(text) })
+        { input_layer.input_seq : lb.logits(text, np.int32) })
     if len(n_char_probs) == 1:
         return lb.index_chars[0]
-    # The model isn't going to give us an exact probabilty distribution
-    # because of rounding errors. Numpy's multinomial has an assertion
-    # that the probabilities (except the last) don't exceed one. So
-    # let's just fudge the second to last character (whatever it is) by
-    # the difference to fix this problem.
+    # The model isn't going to give us an exact probabilty distribution because
+    # of rounding errors. Numpy's multinomial has an assertion that the
+    # probabilities (except the last) don't exceed one. So let's just fudge the
+    # second to last character (whatever it is) by the difference to fix this
+    # problem.
     fudge = max(sum(n_char_probs[:-1]) - 1, 0)
-    n_char_probs[-2] -= fudge
+    prev_m2_val = n_char_probs[-2]
+    # just in case we lost some precision in the sum, lets double the fudge
+    # factor. There may be a cleaner way to handle those cases, but floating
+    # point is hard.
+    n_char_probs[-2] -= 2 * fudge
     samples = np.random.multinomial(1, n_char_probs)
     n_char = np.argmax(samples)
     assert samples[n_char] == 1
@@ -403,6 +415,9 @@ with tf.Session() as sess:
     else:
         print("No checkpoints, initializing for the first time...", end=' ',
             flush=True)
+        # TODO: trace this and see why it is using so much memory and time. To
+        # point that the process is killed by the OS. (Probably the orthogonal
+        # initializizer)
         sess.run(tf.global_variables_initializer())
     print("done.")
 
@@ -432,12 +447,13 @@ with tf.Session() as sess:
         mini_batches = [lb.train_books[pos : pos + book_minibatch_size]
             for pos in range(0, len(lb.train_books), book_minibatch_size)]
 
-        for book_batch in mini_batches:
+        for idx, book_batch in enumerate(mini_batches):
             sess.run([acc_g.initializer for acc_g in acc_gs])
             for book in book_batch:
                 epoch_loss += train_book(sess, book)
             total_cs = sum(len(book) for book in book_batch)
             sess.run(apply_grads, { total_minibatch_characters : total_cs})
+            print((idx + 1) / len(mini_batches) * 100, "% through the epoch.")
 
         total_predictions = sum(len(book) - 1 for book in lb.train_books)
 
