@@ -32,7 +32,7 @@ cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
     type=int, required=True, help="Number of dimensons of the first layer above"
     " the input")
 
-cmd_arg_def.add_argument("-f", "--dim_scale", metavar='channel_scale_factor',
+cmd_arg_def.add_argument("-ds", "--dim_scale", metavar='channel_scale_factor',
     type=float, required=True, help=("The factor of change of dimensons between"
     " layers. Should be between 1 and 2. Anything more than 2 will be trying to"
     " add information that isn't there. Anything less than 1 is probably losing"
@@ -106,6 +106,8 @@ def make_conv_op(input, filter_weights, filt_bias):
 
     assert len(input.shape) == 2
     assert len(filter_weights.shape) == 3
+    assert input.shape[0] % 2 == 0
+
     filt = tf.matmul(tf.reshape(input, [-1, 2 * input.shape[1].value]),
             tf.reshape(filter_weights, [-1, filter_weights.shape[-1].value]))
 
@@ -661,6 +663,9 @@ output = tf.layers.dense(
 
 target = tf.placeholder(tf.int32, shape=[])
 
+# TODO: would weighted_cross_entropy_with_logits allow us to control how much
+# new training blows out alternative values?
+
 loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
     labels = target, logits = output)
 
@@ -765,6 +770,9 @@ def train_book(sess, book):
 checkpoint_dir = "checkpoints/"
 
 vars_to_save = list(tf.trainable_variables()) # copy the list
+
+# TODO: this is super bugged beccause we miss the non slot variables in the
+# optimizer like the Adam beta accumulators.
 
 for var in train_vars:
     for slot_name in optimizer.get_slot_names():

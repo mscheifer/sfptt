@@ -1,8 +1,13 @@
+from __future__ import absolute_import, division, print_function
+from __future__ import unicode_literals
+
 import unidecode
 import string
 import numpy as np
+import io
+import os
 
-character_set = set()
+import tensorflow as tf
 
 def parse_file(file_name):
     data_set = []
@@ -20,46 +25,105 @@ def parse_file(file_name):
 #validation_books = parse_file("../datasets/CBTest/data/cbt_valid.txt")
 #test_books = parse_file("../datasets/CBTest/data/cbt_test.txt")[:1]
 
-seq = ("aaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaab"
-       "aaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaab")
+def load_training_data(directory):
 
-seq2 = ("aaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+    books_dirs = []
+    books_dirs.append(directory + "/ohenry/")
+    books_dirs.append(directory + "/misc_stories/")
+    books_dirs.append(directory + "/aesop/")
+    #books_dirs.append(directory + "/shakespeare/")
 
-seq3 = ("abcaaaabaaaaaaaaaaaaaaacaaaaaaaaaaaaaaab")
+    train_books = []
+    for books_dir in books_dirs:
+        lookup_path = books_dir + "*"
+        print(lookup_path)
+        books = tf.train.match_filenames_once(lookup_path)
 
-seq4 = ("aaaab")
+        queue = tf.train.string_input_producer(books, num_epochs=1)
 
-def five_random_letters():
-    return ''.join(np.random.choice(np.array(list(string.ascii_uppercase)), size=5))
+        reader = tf.WholeFileReader()
+        _, bookcontents = reader.read(queue)
 
-#train_books = ((five + '-' + ('a' * int(np.random.rand() * 30)) + '-' + five)
-#    for five in (five_random_letters() for _ in range(100)))
+        init_op = (tf.global_variables_initializer(),
+            # NEED LOCAL INIT TOO FOR MATCH_FILENAMES_ONCE GRRRRRRRR
+            tf.local_variables_initializer())
 
-train_books = [seq3] * 4
+        with tf.Session() as sess:
+            sess.run(init_op)
 
-# For testing the algorithm, lets just reduce the total paramters by removing
-# upper case letters and accents
-#train_books = [unidecode.unidecode(book).lower() for book in train_books]
+            coord = tf.train.Coordinator()
+            threads = tf.train.start_queue_runners(coord=coord)
 
-for book in train_books:
-    for letter in book:
-        character_set.add(letter)
+            try: # this is the pattern Google recommends...
+                while not coord.should_stop():
+                    contents = sess.run(bookcontents)
+                    train_books.append(contents.decode("utf-8"))
+            except tf.errors.OutOfRangeError:
+                print("Loaded all books")
+            finally:
+                coord.request_stop()
+            coord.join(threads)
+#        for book in os.listdir(books_dir):
+#        for book in cloudstorage.listbucket(books_dir):
+#            with io.open(books_dir + book, 'r') as f:
+#            with cloudstorage.open(books_dir + book, 'r') as f:
+#                try:
+#                    train_books.append(f.read())
+#                except BaseException as e:
+#                    print("Error with book:", f.name)
+#                    raise e
 
-char_indices = { character : c_idx for c_idx, character in enumerate(sorted(character_set)) }
-index_chars = { c_idx : character for character, c_idx in char_indices.items() }
+    seq = ("aaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaab"
+           "aaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaabaaaaaaab")
 
-print(sorted(char_indices.items()), len(character_set))
+    seq2 = ("aaaaaaabaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
 
-def logits(str, int_type):
-    assert len(char_indices) <= np.iinfo(int_type).max
-    return np.array(list((char_indices[char] if char != 0 else 0) for char in str), dtype=int_type)
+    seq3 = ("abcaaaabaaaaaaaaaaaaaaacaaaaaaaaaaaaaaab")
 
-def one_hot(str):
-    ret = np.zeros([len(str), len(character_set)])
-    for idx, char in enumerate(str):
-        if char != 0: ret[idx, char_indices[char]] = 1
-    return ret
+    seq4 = ("aaaab")
 
-def output_as_str(probabilities):
-    return "".join([index_chars[np.argmax(vec)] for vec in probabilities])
+    train_books = [book for book in train_books if (len(book) < 16000)]
+
+    print("Num books is: ", len(train_books))
+
+    # For testing, lets just reduce the total paramters by removing accents
+    train_books = [unidecode.unidecode(book) for book in train_books]
+    import re # Remove control characters except new lines
+
+    train_books = [re.sub(r"\r\n", "\n", book) for book in train_books] #dos2unix
+    # replace all non-tab or newline control characters with space
+    train_books = [re.sub(r"[\x00-\x08]|[\x0B-\x1F]|\x7f", " ", book) for book in train_books]
+
+    character_set = set()
+
+    character_set.update(string.printable)
+    character_set.remove('\r') # Don't care about carriage return, just use newline (line feed)
+    character_set.remove('\x0b') # Don't care about vertical tab
+    character_set.remove('\x0c') # Don't care about form feed (new page)
+
+    assert all((character_set.contains(c) for c in book) for book in train_books)
+
+    char_indices = { character : c_idx for c_idx, character in enumerate(sorted(character_set)) }
+    index_chars = { c_idx : character for character, c_idx in char_indices.items() }
+
+    print(sorted(char_indices.items()), len(character_set))
+
+    class Books:
+        def __init__(self):
+            self.train_books = train_books
+            self.character_set = character_set
+            self.char_indices = char_indices
+            self.index_chars = index_chars
+
+        def logits(self, str, int_type):
+            assert len(self.char_indices) <= np.iinfo(int_type).max
+            return np.array(list(self.char_indices[char] for char in str), dtype=int_type)
+
+        def one_hot(self, str):
+            ret = np.zeros([len(str), len(self.character_set)])
+            for idx, char in enumerate(str):
+                if char != 0: ret[idx, self.char_indices[char]] = 1
+            return ret
+
+    return Books()

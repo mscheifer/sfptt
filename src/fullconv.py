@@ -1,23 +1,12 @@
-seed = 3247238
-
-import random
-random.seed(seed)
-
-import numpy as np
-np.random.seed(seed)
-
-import tensorflow as tf
-tf.set_random_seed(seed)
-
-import load_books as lb
-import shutil
-
-np.set_printoptions(threshold=np.nan, 
-    linewidth=shutil.get_terminal_size().columns)
+from __future__ import absolute_import, division, print_function
+from __future__ import unicode_literals
 
 import argparse
 
 cmd_arg_def = argparse.ArgumentParser(description="Learn from text")
+
+cmd_arg_def.add_argument("-sd", "--seed", type=int, default = 3247238,
+    help=("Seed value for randomness"))
 
 cmd_arg_def.add_argument("-d", "--debug", help=("Make it easier to catch errors"
     "in the tensorflow implementation"), action="store_true")
@@ -27,10 +16,6 @@ cmd_arg_def.add_argument("-e", "--epochs", metavar='number_of_epochs', type=int,
 
 cmd_arg_def.add_argument("-l", "--learning_rate", type=float, default=0.001,
     help="Learning rate factor")
-
-cmd_arg_def.add_argument("-b", "--base_dims", metavar='input_layer_channels',
-    type=int, required=True, help="Number of dimensons of the first layer above"
-    " the input")
 
 cmd_arg_def.add_argument("-ds", "--dim_scale", metavar='channel_scale_factor',
     type=float, required=True, help=("The factor of change of dimensons between"
@@ -45,9 +30,42 @@ cmd_arg_def.add_argument("-o", "--open", help="Chekpoint file to load.")
 
 cmd_arg_def.add_argument("-f", "--forward", help="Initial string for forward inference.")
 
+cmd_arg_def.add_argument("-tp", "--temperature", type=float, default=1.0,
+    help="Sampling temperature. Lower is more conservative.")
+
+cmd_arg_def.add_argument("-tr", "--training_directory", required=True,
+    help="Directory of training data.")
+
+cmd_arg_def.add_argument("-ch", "--checkpoint_directory", required=True,
+    help="Directory of checkpoints.")
+
 cmd_args = cmd_arg_def.parse_args()
 
-# TODO: so what this should be is: Every layer produces len(target) values. The
+seed = cmd_args.seed
+
+import random
+random.seed(seed)
+
+import numpy as np
+np.random.seed(seed)
+
+import tensorflow as tf
+tf.set_random_seed(seed)
+
+del seed
+
+import shutil
+
+try:
+    print_width = shutil.get_terminal_size().columns
+except AttributeError: # We're in Python 2
+    print_width = 80
+np.set_printoptions(threshold=np.nan, linewidth=print_width)
+
+import src.load_books
+lb = src.load_books.load_training_data(cmd_args.training_directory)
+
+# What this is is: Every layer produces len(target) values. The
 # upper layer takes those values and half of them are linearly translated up
 # and the other half are linearly combined with the odd value at that layer and
 # then tanh'd. The dimensions for the elements in both of those halves are the
@@ -79,33 +97,25 @@ def make_weights(name, shape):
     init = tf.orthogonal_initializer(gain=1.3) # 1.3 is for tanh
     return tf.Variable(init(shape, tf.float32), name=name + "_weights")
 
-bridge_out_size = 150
+bridge_out_size = 500
 
-def make_bridge(conv, bridge_weights, conv_is_logits=False):
+def make_bridge(conv, bridge_weights):
 
-    ret = conv[::2] # odd values, keep the last value if total is odd
-    if conv_is_logits:
-        ret = tf.gather(bridge_weights, ret)
-    else:
-        ret = tf.matmul(ret, bridge_weights)
+    conv_size = tf.shape(conv)[0]
 
-    last_odd_val = ret[-1:]
-    conv_is_odd = tf.equal(tf.shape(conv)[0] % 2, 1)
+    conv_is_odd = tf.equal(conv_size % 2, 1)
+    # Boolean to disambiguate if this value is part of an upper layer pair or is a single
+    is_included_in_upper_layer = tf.tile([0.0,1.0], [conv_size // 2])
 
-    # Check the original, size of 'ret' is always odd
-    # don't pad from the last odd value
-    ret = tf.cond(conv_is_odd, lambda: ret[:-1], lambda: ret)
+    is_included_in_upper_layer = tf.cond(conv_is_odd,
+        lambda: tf.concat([is_included_in_upper_layer, tf.zeros([1], tf.float32)], axis=0),
+        lambda: is_included_in_upper_layer)
 
-    ret = tf.pad(tf.expand_dims(ret, 1), [[0,0], [0,1], [0,0]])
-    # Pad with 1 zero at each value then reshape again so it's like we just put
-    # 0s over all of the even values, but then have a broadcast dimension over
-    # the chunk size
-    ret = tf.reshape(ret, [-1, 1, bridge_out_size])
+    with_disambiguation = tf.concat([conv, tf.expand_dims(is_included_in_upper_layer, 1)], axis=1)
 
-    ret = tf.cond(conv_is_odd,
-        lambda: tf.concat([ret, tf.expand_dims(last_odd_val, 0)], 0),
-        lambda: ret)
-    return ret
+    ret = tf.matmul(with_disambiguation, bridge_weights)
+    # reshape to add broadcast dimension
+    return tf.reshape(ret, [-1, 1, bridge_out_size])
 
 def make_layer(lower_layer, num_output_channels, chunk_size, bridge_weight):
 
@@ -137,31 +147,24 @@ def make_layer(lower_layer, num_output_channels, chunk_size, bridge_weight):
     chunked_lower = tf.reshape(bridge_no_early_values[:full_chunks * chunk_size],
         [full_chunks, chunk_size, bridge_out_size])
 
-    bridge_conv = conv[0:-1]
+    bridge_conv = make_bridge(conv, bridge_weight)
 
-    w_br = chunked_lower + make_bridge(bridge_conv, bridge_weight)
+    w_br = chunked_lower + bridge_conv[0:-1]
     bridge_pieces.append(tf.reshape(w_br, [-1, bridge_out_size]))
-
-    num_results_is_odd = tf.equal(tf.shape(conv)[0] % 2, 1)
-
-    #TODO: would it be faster to multiply the bridge value by
-    # conv.shape[0] % 2 (so 0 when even) rather than do the conditional?
 
     # slice off the remainder
     final_bridge = bridge_no_early_values[full_chunks * chunk_size:]
     # If num results is even, don't use the conv value because it is part of the
     # upper layer value
-    final_bridge = tf.cond(num_results_is_odd,
-        lambda: final_bridge + tf.matmul(conv[-1:], bridge_weight),
-        lambda: final_bridge)
+    final_bridge = final_bridge + tf.reshape(bridge_conv[-1:], [-1, bridge_out_size])
 
     bridge_pieces.append(final_bridge)
 
     class Layer:
         def __init__(self):
-            # If we have an odd number of results, don't push the last one up. It
-            # will be bridged.
-            self.result_op = tf.cond(num_results_is_odd,
+            # Only push up an even number of results to be convolved over. Drop
+            # the most recent one if odd
+            self.result_op = tf.cond(tf.equal(tf.shape(conv)[0] % 2, 1),
                 lambda: conv[0:-1], lambda: conv)
             self.bridge = tf.concat(bridge_pieces, 0)
 
@@ -176,37 +179,37 @@ class Input:
         self.input_seq = tf.placeholder(shape=[None], dtype=tf.int32,
             name="input_logits")
 
-        even_result = tf.cond(tf.equal(tf.shape(self.input_seq)[0] % 2, 1),
-            lambda: self.input_seq[0:-1], lambda: self.input_seq)
+        one_hots = tf.one_hot(self.input_seq, len(lb.character_set))
 
-        self.result_op = tf.one_hot(even_result, len(lb.character_set))
+        self.result_op = tf.cond(tf.equal(tf.shape(one_hots)[0] % 2, 1),
+            lambda: one_hots[0:-1], lambda: one_hots)
 
-        # rather than multiplying the input as one hot vectors, we will
-        # just to tf.gather on the input logits.
-
-        self.bridge = tf.reshape(make_bridge(self.input_seq, bridge_weight,
-            True), [-1, bridge_out_size])
+        self.bridge = tf.reshape(make_bridge(one_hots, bridge_weight),
+             [-1, bridge_out_size])
 
 import math
 
 # Floor because we want a power of 2 less than max_len. If we took a power of 2
 # greater than max_len then we would never use that value (because we would
 # never have enough input).
-num_layers = int(math.floor(math.log2(max_len)))
+# TODO: can use math.log2 if we drop python2 compatability
+num_layers = int(math.floor(math.log(max_len, 2)))
 print("Max book length", max_len, "so number of layers is", num_layers)
 
 memory_scale_factor = cmd_args.dim_scale
 
-base_channels = cmd_args.base_dims
+base_channels = len(lb.character_set)
 
-layer_channels = [int(math.ceil(base_channels * (memory_scale_factor ** i)))
+layer_channels = [int(math.ceil(base_channels * (memory_scale_factor ** (i + 1))))
     for i in range(num_layers)]
 
-bridge_weight = make_weights("bridge",
-    [len(lb.character_set) + sum(layer_channels), bridge_out_size])
+# add one more input element for each layer and the input layer for the
+# disabiguation boolean
+bridge_weight = make_weights("bridge", [len(lb.character_set) + 1 +
+    sum(layer_channels) + num_layers, bridge_out_size])
 
 with tf.name_scope("input"):
-    layer = Input(bridge_weight[:len(lb.character_set)])
+    layer = Input(bridge_weight[:len(lb.character_set) + 1])
 input_layer = layer
 
 for i in range(num_layers):
@@ -214,12 +217,11 @@ for i in range(num_layers):
     # output vector of the layer we are about to create
     chunk_size = 2 ** (i + 1)
 
-    prev_ch = len(lb.character_set) + sum(layer_channels[:i])
-    bridge_weight_piece = bridge_weight[prev_ch : prev_ch + layer_channels[i]]
+    prev_ch = len(lb.character_set) + 1 + sum(layer_channels[:i]) + i
+    br_weight_part = bridge_weight[prev_ch : prev_ch + layer_channels[i] + 1]
 
     with tf.name_scope("layer_" + str(i)):
-        layer = make_layer(layer, layer_channels[i], chunk_size,
-            bridge_weight_piece)
+        layer = make_layer(layer, layer_channels[i], chunk_size, br_weight_part)
         print("Layer", i, "has", layer_channels[i], "channels and",
             layer.result_op.shape[0], "values to pass up to the next layer.")
 
@@ -228,7 +230,7 @@ first_bridge_bias = tf.Variable(tf.zeros([1, bridge_out_size],
 
 first_bridge = tf.tanh(layer.bridge + first_bridge_bias)
 
-layer_sizes = [100, 75]
+layer_sizes = [500, 200]
 
 output = first_bridge
 for size in layer_sizes:
@@ -251,7 +253,7 @@ output = tf.layers.dense(
     # should default to 0 initialized bias
     name="output_characters")
 
-next_char = tf.nn.softmax(output[-1])
+next_char = tf.nn.softmax(output[-1] / cmd_args.temperature)
 
 target = tf.placeholder(tf.int32, shape=[None])
 
@@ -277,8 +279,10 @@ else:
 
 train_vars = [v for _, v in grads_and_vars]
 
+translator = dict((ord(char), "_") for char in "/:")
+
 acc_gs = [tf.Variable(tf.fill(g.shape, np.float32(0)), trainable=False,
-    name=v.name.translate(str.maketrans("/:", "__")) + "_grad")
+    name=v.name.translate(translator) + "_grad")
     for g, v in grads_and_vars]
 
 del grads_and_vars
@@ -309,15 +313,11 @@ apply_grads = optimizer.apply_gradients(zip((ag / tf.cast(
 
 book_loss_op = tf.reduce_sum(loss)
 
-import shutil
-
-print_width=shutil.get_terminal_size().columns
-
 import re
 
 def train_book(sess, orig_book):
 
-    print("Book length:", len(orig_book))
+#    print("Book length:", len(orig_book))
     # Adding some newlines at the start should help it be more translationally
     # invariant
     perturb_len = random.randint(0, 5)
@@ -351,18 +351,26 @@ def train_book(sess, orig_book):
     def simplify_whitespace(s):
         return re.sub(r"\s", " ", s)
 
-    print(simplify_whitespace(orig_to_print))
-    print(simplify_whitespace(predict_book))
+#    print(simplify_whitespace(orig_to_print))
+#    print(simplify_whitespace(predict_book))
 
     return book_loss
 
-checkpoint_dir = "checkpoints/"
+checkpoint_dir = cmd_args.checkpoint_directory + "/"
 
-print("Initializing checkpoint saver...", end=' ', flush=True)
+import sys
+
+# grr, Google why are you making me use Python 2.7 ?
+def print_flushed(*strs, **kwargs):
+    print(*strs, sep=kwargs.get("sep", ' '), end=kwargs.get("end", '\n'))
+    sys.stdout.flush()
+
+print_flushed("Initializing checkpoint saver...", end=' ')
 saver = tf.train.Saver() # Buy default saves all variables, including stuff
-# beta power accumulators in the Optimizer
-import os
-os.makedirs(checkpoint_dir, exist_ok=True)
+# like beta power accumulators in the Optimizer
+
+#import os # grr, disabling until I de-support python2
+#os.makedirs(checkpoint_dir, exist_ok=True)
 print("done.")
 
 #TODO: ok so deliberately stop propagating gradients through some paths to see
@@ -372,37 +380,24 @@ print("done.")
 
 book_minibatch_size = 10
 
-import objgraph
-import pympler.asizeof
-
 def runforward(sess):
     n_char_probs = sess.run(next_char,
         { input_layer.input_seq : lb.logits(text, np.int32) })
-    if len(n_char_probs) == 1:
-        return lb.index_chars[0]
-    # The model isn't going to give us an exact probabilty distribution because
-    # of rounding errors. Numpy's multinomial has an assertion that the
-    # probabilities (except the last) don't exceed one. So let's just fudge the
-    # second to last character (whatever it is) by the difference to fix this
-    # problem.
-    fudge = max(sum(n_char_probs[:-1]) - 1, 0)
-    prev_m2_val = n_char_probs[-2]
-    # just in case we lost some precision in the sum, lets double the fudge
-    # factor. There may be a cleaner way to handle those cases, but floating
-    # point is hard.
-    n_char_probs[-2] -= 2 * fudge
-    samples = np.random.multinomial(1, n_char_probs)
-    n_char = np.argmax(samples)
-    assert samples[n_char] == 1
-    assert np.all(np.equal(samples[:n_char], 0))
-    assert np.all(np.equal(samples[n_char+1:], 0))
-    return lb.index_chars[n_char]
+
+    return lb.index_chars[np.argmax(n_char_probs)]
+
+    f = np.random.uniform()
+    prob_sum = 0
+    for idx, prob in enumerate(n_char_probs):
+        prob_sum += prob
+        if f <= prob_sum:
+            return lb.index_chars[idx]
+    return lb.index_chars[-1] # might happen if what the NN gives us isn't a
+    # perfect probability distribution, which it can be due to rounding errors
 
 with tf.Session() as sess:
 
     print("Session start")
-
-#    print(pympler.asizeof.asized(objgraph.by_type('Tensor'), detail=1).format())
 
     if cmd_args.open is None:
         to_load_from = tf.train.latest_checkpoint(checkpoint_dir)
@@ -410,15 +405,16 @@ with tf.Session() as sess:
         to_load_from = cmd_args.open
 
     if to_load_from is not None:
-        print("Loading from:", to_load_from, "...", end=' ', flush=True)
+        print_flushed("Loading from:", to_load_from, "...", end=' ')
         saver.restore(sess, to_load_from)
     else:
-        print("No checkpoints, initializing for the first time...", end=' ',
-            flush=True)
+        print_flushed("No checkpoints, initializing for the first time...", end=' ')
         # TODO: trace this and see why it is using so much memory and time. To
         # point that the process is killed by the OS. (Probably the orthogonal
         # initializizer)
         sess.run(tf.global_variables_initializer())
+
+        save_path = saver.save(sess, checkpoint_dir + "save", global_step=0)
     print("done.")
 
     if cmd_args.forward is not None:
@@ -426,14 +422,16 @@ with tf.Session() as sess:
         print(text, end='')
         while True:
             n_char = runforward(sess)
-            print(n_char, end='', flush=True)
+            print_flushed(n_char, end='')
             text += n_char
 
-    lowest_loss_so_far = math.inf
+    lowest_loss_so_far = float('inf') # grr, 3.5 has 'math.inf'
 
     epochs = cmd_args.epochs
 
-    plateaus = [0]
+    plateaus = [[0,0]]
+
+    total_predictions = sum(len(book) - 1 for book in lb.train_books)
 
     for epoch in range(epochs):
         print("\nEpoch", epoch, "\n")
@@ -453,21 +451,22 @@ with tf.Session() as sess:
                 epoch_loss += train_book(sess, book)
             total_cs = sum(len(book) for book in book_batch)
             sess.run(apply_grads, { total_minibatch_characters : total_cs})
-            print((idx + 1) / len(mini_batches) * 100, "% through the epoch.")
-
-        total_predictions = sum(len(book) - 1 for book in lb.train_books)
+#            print((idx + 1) / len(mini_batches) * 100, "% through the epoch.")
 
         loss_per_character = epoch_loss / total_predictions
 
         print("Loss per character:", loss_per_character, end=' ')
 
         if loss_per_character < lowest_loss_so_far:
+            diff = lowest_loss_so_far - loss_per_character
             lowest_loss_so_far = loss_per_character
-            if plateaus[0] > 0: plateaus.insert(0, 0)
+            if plateaus[0][0] > 0: plateaus.insert(0, [0, diff])
             print("which is the best so far")
+            print("Saved best to:", saver.save(sess, checkpoint_dir + "best"))
         else:
-            plateaus[0] += 1
-            print("which isn't better than: ", lowest_loss_so_far, *plateaus)
+            plateaus[0][0] += 1
+            plateau_str = ("{} {:.1e}".format(*plateau) for plateau in plateaus)
+            print("which isn't better than: ", lowest_loss_so_far, *plateau_str)
 
         save_path = saver.save(sess, checkpoint_dir + "save", global_step=epoch)
         print("Saved to:", save_path)
